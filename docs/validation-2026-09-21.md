@@ -1,5 +1,9 @@
 # Runtime fixes and acceptance status
 
+Latest status (22:48): the Codex native team, native budget and interactive
+tmux budget acceptance chains passed. Earlier failures below are retained as
+history. See the final evidence section for scope and limitations.
+
 The initial real audit at commit 678a898 completed native delegation, but both
 budget workers used Astra Low instead of Luna High. The interactive tmux audit
 could not connect to the socket inside a workspace-write, approval-never sandbox.
@@ -65,3 +69,50 @@ launches, and validate tmux with an explicitly chosen normal approval policy for
 both lead and worker sessions. Preflight is diagnostic; it does not make a
 socket-denied, approval-never policy compatible with pane workers. No silent
 sandbox relaxation or unapproved fallback should be added.
+
+## Final evidence: complete Codex chain (22:48)
+
+A real tmux budget run used the existing localhost proxy and normal automatic
+approval (`--approve-for-me`) for both lead and workers, with the evidence
+directory explicitly writable. The initial sandboxed doctor failed, then the
+same command succeeded through the CLI's normal approval flow. No sandbox
+bypass was added. Two worker repository-trust prompts were accepted by the
+observer and recorded; this was not an unattended test.
+
+The lead and both workers were interactive CLI sessions. Metadata verified
+Astra Medium for the lead and Luna High for both workers. Worker B reported
+cwd propagation evidence (message 1), worker A reported budget configuration
+evidence (message 2), and the lead independently checked source lines. The lead
+sent message 3 with `--wake` to worker A. The same worker session ran `pwd` again
+and returned message 4. Its pane remained %2 and its transcript contains two
+completed turns; no new worker was spawned for follow-up.
+
+All three sessions used the repository cwd. Recorded pane coordinates show the
+lead on the left and workers stacked on the right. After the lead collected all
+three reports and wrote its audit, the observer sent Ctrl-D only to the idle
+lead. Every team pane closed automatically; the original harness pane survived.
+The observer then removed the isolated test server.
+
+A separate native team run completed a read-only source audit with exactly two
+Astra Low fresh-context workers. Together with the prior successful native
+budget run using two Luna High workers, both presets have actual model metadata
+and completed task evidence.
+
+An independent evidence audit passed 17 checks across completion, model/effort,
+fresh contexts, interactive sessions, task-mode separation, message flow, same
+session reuse, consumed reports, layout, cwd, completion artifacts, cleanup and
+an unchanged repository during the live task. Built-in guardian sessions are
+approval infrastructure, not native task workers.
+
+Evidence root: `~/.local/state/agent-team-validation/full-20260921-224334`.
+Primary artifacts: `evidence-audit.json`, `state-before-exit.json`,
+`final-session-metadata.json`, `layout-final.txt`, `screens/*-final.txt`,
+`observer-actions.jsonl`, `cleanup.json`, `audit.md`, `native-team.jsonl`.
+Native budget evidence: `../diagnose-20260921-223702`.
+The retained `launch-full.py` records the exact setup and task; it invokes real
+models and is not part of the automated test suite.
+
+This closes the Codex validation chain. It does not certify live operation of
+TraeX/OpenCode/Claude, unattended first-use trust handling, or comparative model
+quality/cost. Native model selection remains instruction/config based rather
+than an API-level hard lock.
