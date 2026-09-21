@@ -93,3 +93,46 @@ simulated tmux tests do not certify model quality or every provider's support.
 
 Run `python3 -B -m unittest discover -s tests -v`. Tests use an isolated tmux
 server and mock interactive CLIs; they do not send model requests.
+
+## Runtime validation and permissions
+
+The resolved preset and worker model/effort are injected into the lead's
+instructions. Native workers must use those values explicitly and report an
+unavailable combination instead of substituting another model. This is a native
+agent instruction, not an API-level model lock; verify actual child session
+metadata in live acceptance runs. Native launches remove inherited AGENT_TEAM_*
+variables so a nested native session does not retain pane-controller identity.
+
+For Codex/TraeX pane launches, `-C DIR` / `--cd DIR` are normalized before creating
+the team. The lead, workers and state share that directory. Conflicting worker
+cwd flags are rejected. The tmux socket path is recorded in team state so shell
+tools need not preserve TMUX to find the correct server. Worker names are
+lowercase identifiers such as `worker_a`, never `A` or `B`.
+
+Run `agent-team doctor` from the agent's shell execution context before writing
+briefs. It verifies socket access and pane ownership. Spawn, stop and wake also
+check the control channel before performing changes. A check in an ordinary
+host shell does not establish that a sandboxed shell has the same access.
+
+For Codex with an explicit `-P` / `--permission-profile`, or explicit read-only /
+workspace-write `--sandbox`, the pane runner also performs a model-free
+`codex sandbox` probe before starting the interactive CLI. It preserves managed
+requirements and writes `preflight-<role>.json`. With explicit approval policy
+`never`, a failed probe stops before inference. Otherwise the diagnostic is
+shown and the CLI starts so the normal approval flow remains available. This requires a Codex version
+supporting named sandbox permission profiles. For inherited/default permissions,
+other sandbox overrides and other CLIs, the in-session doctor is required; the
+launcher does not guess the effective permissions. Extra writable directories
+are not socket permissions.
+
+A restricted Linux sandbox can deny tmux socket connections. In that case the
+team stops delegation with the exact error; it does not silently fall back to
+native workers or change sandbox settings. Use the coding CLI's normal approval
+mechanism when permitted, or an explicitly authorized permission profile that
+can access tmux. Profiles with approval disabled and socket access denied cannot
+run pane workers. The wrapper never adds a permission bypass. The team state
+directory must also be writable by each member to exchange reports; authorize
+that directory with the CLI's normal writable-root configuration when needed.
+
+See [the regression report](docs/validation-2026-09-21.md) for the distinction
+between automated checks and live acceptance evidence.

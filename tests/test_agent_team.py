@@ -31,6 +31,61 @@ class AdapterTests(unittest.TestCase):
                 self.assertNotIn('--profile', args)
                 self.assertIn('gpt-6-astra', args)
 
+    def test_budget_prompt_matches_custom_resolved_settings(self):
+        cfg = {'model': 'lead-model', 'worker_model': 'budget-worker',
+               'worker_effort': 'high', 'limit': 2}
+        args, _ = TEAM.command('codex', cfg, 'native', budget=True)
+        prompt = json.loads(next(x.split('=', 1)[1] for x in args
+                                 if x.startswith('developer_instructions=')))
+        resolved = json.loads(next(line for line in prompt.splitlines() if line.startswith('{')))
+        self.assertEqual(resolved['preset'], 'team-budget')
+        self.assertEqual(resolved['worker_model'], 'budget-worker')
+        self.assertEqual(resolved['worker_effort'], 'high')
+        self.assertIn('agents.default_subagent_model="budget-worker"', args)
+        self.assertNotIn('gpt-6-astra', prompt)
+
+    def test_native_drops_inherited_pane_identity_for_every_adapter(self):
+        inherited = {'AGENT_TEAM_DIR': '/previous/team', 'AGENT_TEAM_ROLE': 'lead',
+                     'AGENT_TEAM_FUTURE_TOKEN': 'old'}
+        with patch.dict(os.environ, inherited):
+            for tool in TEAM.TOOLS:
+                _, env = TEAM.command(tool, {'limit': 2}, 'native')
+                self.assertFalse(any(k.startswith('AGENT_TEAM_') for k in env))
+                self.assertEqual(os.environ['AGENT_TEAM_ROLE'], 'lead')
+
+    def test_cwd_is_normalized_without_consuming_literal_prompt(self):
+        with tempfile.TemporaryDirectory() as folder:
+            for flag in (['-C', folder], ['--cd=' + folder]):
+                cwd, rest = TEAM.working_directory('codex', flag + ['--', '-C', 'literal'])
+                self.assertEqual(cwd, str(Path(folder).resolve()))
+                self.assertEqual(rest, ['--', '-C', 'literal'])
+        with self.assertRaisesRegex(RuntimeError, 'requires a directory'):
+            TEAM.working_directory('codex', ['-C'])
+
+    def test_preflight_keeps_selected_permissions_and_reports_denial(self):
+        with tempfile.TemporaryDirectory() as folder:
+            env = dict(os.environ, AGENT_TEAM_DIR=folder, AGENT_TEAM_ROLE='lead')
+            result = subprocess.CompletedProcess([], 1, '', 'Operation not permitted')
+            with patch.object(TEAM.subprocess, 'run', return_value=result) as run:
+                with self.assertRaisesRegex(RuntimeError, 'no model session started'):
+                    TEAM.codex_preflight(['codex', '--profile', 'team-budget',
+                                          '--sandbox', 'workspace-write', '-a', 'never'], env, folder)
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[:2], ['codex', 'sandbox'])
+            self.assertIn('team-budget', argv)
+            self.assertIn(':workspace', argv)
+            self.assertNotIn('danger-full-access', ' '.join(argv))
+            self.assertFalse(json.loads((Path(folder) / 'preflight-lead.json').read_text())['ok'])
+
+    def test_preflight_does_not_prevent_normal_approval_flow(self):
+        with tempfile.TemporaryDirectory() as folder:
+            env = dict(os.environ, AGENT_TEAM_DIR=folder, AGENT_TEAM_ROLE='lead')
+            result = subprocess.CompletedProcess([], 1, '', 'socket denied')
+            with patch.object(TEAM.subprocess, 'run', return_value=result), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                TEAM.codex_preflight(['codex', '-P', ':workspace', '-a', 'on-request'], env, folder)
+            self.assertIn('normal approval flow', err.getvalue())
+
     def test_picker_selects_tool_preset_and_mode(self):
         with patch.object(TEAM.sys, 'argv', ['agent-team', '--tmux']), \
                 patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \
@@ -179,6 +234,24 @@ class PaneTests(unittest.TestCase):
         self.assertEqual(len(self.state()['members']), 3)
         self.control('stop', 'two')
         self.assertEqual(self.state()['members']['two']['status'], 'stopped')
+
+    def test_doctor_and_denied_spawn_preserve_members(self):
+        self.assertTrue(json.loads(self.control('doctor'))['ok'])
+        before = self.state()
+        denied = subprocess.CompletedProcess([], 1, '', 'Operation not permitted')
+        with patch.object(TEAM.subprocess, 'run', return_value=denied):
+            with self.assertRaisesRegex(RuntimeError, 'normal approval mechanism'):
+                self.control('spawn', 'worker_a', '--file', self.file('brief', 'task'))
+        self.assertEqual(self.state()['members'], before['members'])
+        self.assertEqual(self.state()['messages'], [])
+
+    def test_recorded_socket_survives_stripped_tmux_environment(self):
+        env = dict(self.env, PATH=os.environ['PATH'])
+        env.pop('TMUX', None)
+        env.pop('TMUX_PANE', None)
+        with patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(io.StringIO()) as out:
+            TEAM.control(['doctor'])
+        self.assertTrue(json.loads(out.getvalue())['ok'])
 
     def test_main_exit_closes_workers_but_not_original_window(self):
         self.spawn('one')

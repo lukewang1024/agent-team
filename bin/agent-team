@@ -80,8 +80,18 @@ def settings(tool, budget):
     return value
 
 
-def instructions(mode, worker=False):
-    common = (CONFIG / "team-rules.md").read_text()
+def instructions(mode, worker=False, cfg=None, budget=False):
+    cfg = cfg or {}
+    selected = {"preset": "team-budget" if budget else "team", "mode": mode,
+                **{key: cfg.get(key) for key in ("model", "effort", "worker_model", "worker_effort")}}
+    common = ("Resolved configuration for THIS invocation (authoritative; do not infer it "
+              "from other profiles or repository examples):\n" + json.dumps(selected) + "\n"
+              "Use exactly these configured worker settings when delegating. Never substitute "
+              "another model/effort or automatically switch presets. If the native spawn tool "
+              "accepts model and reasoning_effort, explicitly pass worker_model and worker_effort "
+              "when non-null, with fresh context (fork_turns=none). Leave null settings inherited. "
+              "If unavailable, report a blocker; do not silently fall back.\n"
+              + (CONFIG / "team-rules.md").read_text())
     if worker:
         return "You are a team worker. Do not spawn agents. Follow your assigned brief.\n" + (CONFIG / "team-pane.md").read_text() + common
     marker = "Team delegation mode is enabled.\n" + common
@@ -95,7 +105,11 @@ def instructions(mode, worker=False):
 
 def command(tool, cfg, mode, worker=False, extra=(), brief=None, budget=False):
     env = os.environ.copy()
-    prompt = instructions(mode, worker)
+    if mode == "native":
+        for key in tuple(env):
+            if key.startswith("AGENT_TEAM_"):
+                env.pop(key)
+    prompt = instructions(mode, worker, cfg, budget)
     if mode == "tmux" and os.environ.get("AGENT_TEAM_DIR"):
         prefix = shlex.join(["env", "AGENT_TEAM_DIR=" + os.environ["AGENT_TEAM_DIR"],
                              "AGENT_TEAM_ROLE=" + os.environ.get("AGENT_TEAM_ROLE", "lead"), "agent-team"])
@@ -187,8 +201,17 @@ def command(tool, cfg, mode, worker=False, extra=(), brief=None, budget=False):
     return args, env
 
 
+def tmux_argv(*args):
+    directory = os.environ.get("AGENT_TEAM_DIR")
+    if directory and (Path(directory) / "state.json").exists():
+        socket = read(Path(directory) / "state.json").get("socket")
+        if socket:
+            return ["tmux", "-S", socket, *args]
+    return ["tmux", *args]
+
+
 def tmux(*args, data=None, check=True):
-    result = subprocess.run(["tmux", *args], input=data, text=True, capture_output=True)
+    result = subprocess.run(tmux_argv(*args), input=data, text=True, capture_output=True)
     if check and result.returncode:
         fail(result.stderr.strip() or "tmux command failed")
     return result.stdout.strip()
@@ -223,6 +246,46 @@ def runner(directory, name):
     return shlex.join([sys.executable, str(Path(__file__).resolve()), "run-pane", str(directory), name])
 
 
+def working_directory(tool, argv):
+    """Normalize Codex/TraeX cwd flags once so lead and workers share one cwd."""
+    cwd = Path.cwd()
+    forwarded = []
+    iterator = iter(argv)
+    for arg in iterator:
+        if arg == "--":
+            forwarded.extend([arg, *iterator])
+            break
+        if tool in ("codex", "traex") and arg in ("-C", "--cd"):
+            value = next(iterator, None)
+            if value is None:
+                fail(arg + " requires a directory")
+            cwd = Path(value).expanduser().absolute()
+        elif tool in ("codex", "traex") and (arg.startswith("--cd=") or arg.startswith("-C=")):
+            cwd = Path(arg.split("=", 1)[1]).expanduser().absolute()
+        else:
+            forwarded.append(arg)
+    if not cwd.is_dir():
+        fail("Working directory does not exist: " + str(cwd))
+    return str(cwd.resolve()), forwarded
+
+
+def probe(state, role):
+    """Read-only socket/ownership check in the calling agent's execution context."""
+    if role not in state["members"]:
+        fail("Unknown team member")
+    result = subprocess.run(tmux_argv("show-options", "-p", "-v", "-t",
+                             state["members"][role]["pane"], "@agent_team"),
+                            text=True, capture_output=True)
+    if result.returncode:
+        fail("Team control unavailable in this execution context: " + result.stderr.strip()
+             + ". Stop delegation. Use the coding CLI's normal approval mechanism for "
+             "this command if permitted, or relaunch with an explicitly authorized "
+             "permission configuration. No native fallback or sandbox bypass is performed.")
+    if result.stdout.strip() != state["id"]:
+        fail("Team pane is no longer owned by this session")
+    return {"ok": True, "role": role, "cwd": state["cwd"], "config": state["config"]}
+
+
 def launch(tool, argv):
     budget = False
     pane_mode = False
@@ -251,9 +314,19 @@ def launch(tool, argv):
     forbidden.update({"-p", "--print", "--background", "--bg"} if tool == "claude" else {"exec", "run", "attach", "serve"})
     if pane_mode and any(x in forbidden for x in forwarded):
         fail("--tmux team mode requires a local interactive session")
+    cwd = os.getcwd()
+    if pane_mode:
+        # Include configured arguments; otherwise -C in config would still diverge.
+        cwd, combined = working_directory(tool, cfg.get("args", []) + forwarded)
+        cfg = dict(cfg, args=[])
+        forwarded = combined
+        worker_cwd, worker_args = working_directory(tool, cfg.get("worker_args", []))
+        if worker_args != cfg.get("worker_args", []) and worker_cwd != cwd:
+            fail("worker_args must not select a different working directory")
+        cfg["worker_args"] = worker_args
     args, env = command(tool, cfg, mode, extra=forwarded, budget=budget)
     if dry:
-        print(json.dumps({"tool": tool, "mode": mode, "config": cfg, "argv": args}, ensure_ascii=False, indent=2))
+        print(json.dumps({"tool": tool, "mode": mode, "config": cfg, "cwd": cwd, "argv": args}, ensure_ascii=False, indent=2))
         return
     if not shutil.which(tool):
         fail(f"CLI is not installed: {tool}")
@@ -266,7 +339,7 @@ def launch(tool, argv):
     directory = base / ident
     directory.mkdir(parents=True, mode=0o700)
     state = {"id": ident, "tool": tool, "config": cfg, "budget": budget,
-             "cwd": os.getcwd(), "extra": forwarded, "members": {}, "messages": [], "next_message": 1}
+             "cwd": cwd, "extra": forwarded, "members": {}, "messages": [], "next_message": 1}
     write(directory / "state.json", state)
     shell_command = runner(directory, "lead")
     environment = []
@@ -284,6 +357,7 @@ def launch(tool, argv):
             info = tmux("new-session", "-d", "-P", "-F", "#{window_id} #{pane_id}", "-s", "team-" + ident, "-c", state["cwd"], *environment, shell_command)
         window, pane = info.split()
         with locked(directory) as state:
+            state["socket"] = tmux("display-message", "-p", "-t", pane, "#{socket_path}")
             state["window"] = window
             state["members"]["lead"] = {"pane": pane, "status": "running", "cursor": 0}
             tmux("set-option", "-p", "-t", pane, "@agent_team", ident)
@@ -300,6 +374,78 @@ def launch(tool, argv):
     except BaseException:
         (directory / "failed").touch()
         raise
+
+
+def codex_preflight(args, env, cwd):
+    """Exercise the controller in Codex's sandbox without an inference call."""
+    options = []
+    permission_profile = None
+    sandbox_mode = None
+    approval_policy = None
+    iterator = iter(args[1:])
+    for arg in iterator:
+        if arg == "--":
+            break
+        if arg in ("-c", "--config", "-p", "--profile", "-P", "--permission-profile"):
+            value = next(iterator, None)
+            if value is None:
+                fail(arg + " requires a value")
+            options.extend([arg, value])
+            if arg in ("-P", "--permission-profile"):
+                permission_profile = value
+        elif arg in ("-s", "--sandbox"):
+            value = next(iterator, None)
+            if value is None:
+                fail(arg + " requires a value")
+            sandbox_mode = value
+        elif arg.startswith("--sandbox="):
+            sandbox_mode = arg.split("=", 1)[1]
+        elif arg in ("-a", "--ask-for-approval"):
+            approval_policy = next(iterator, None)
+        elif arg.startswith("--ask-for-approval="):
+            approval_policy = arg.split("=", 1)[1]
+        elif arg in ("-m", "--model", "-i", "--image"):
+            next(iterator, None)
+        elif arg == "--add-dir":
+            next(iterator, None)
+        elif arg.startswith("--add-dir="):
+            pass
+        elif arg in ("--enable", "--disable"):
+            options.extend([arg, next(iterator, "")])
+        elif arg == "--full-auto":
+            sandbox_mode = "workspace-write"
+        elif arg in ("--dangerously-bypass-approvals-and-sandbox", "--yolo"):
+            sandbox_mode = "danger-full-access"
+        elif arg.startswith(("--config=", "--profile=", "--permission-profile=")):
+            options.append(arg)
+            if arg.startswith("--permission-profile="):
+                permission_profile = arg.split("=", 1)[1]
+    if not permission_profile:
+        profile = {"read-only": ":read-only", "workspace-write": ":workspace"}.get(sandbox_mode)
+        if not profile:
+            # Do not guess or override an inherited permission policy. In-session
+            # doctor remains mandatory for these configurations and other CLIs.
+            return
+        options.extend(["-P", profile])
+    # The probe only reads state; writable root differences do not grant socket access.
+    check = ["codex", "sandbox", *options, "--include-managed-config", "-C", cwd, "--", "env",
+             "AGENT_TEAM_DIR=" + env["AGENT_TEAM_DIR"],
+             "AGENT_TEAM_ROLE=" + env["AGENT_TEAM_ROLE"], sys.executable,
+             str(Path(__file__).resolve()), "doctor"]
+    try:
+        result = subprocess.run(check, env=env, cwd=cwd, text=True,
+                                capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        fail("Codex team control preflight timed out; no model session started")
+    record = {"ok": result.returncode == 0, "timestamp": time.time(),
+              "stdout": result.stdout, "stderr": result.stderr}
+    write(Path(env["AGENT_TEAM_DIR"]) / ("preflight-" + env["AGENT_TEAM_ROLE"] + ".json"), record)
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        if approval_policy == "never":
+            fail("Codex team control preflight failed; no model session started. " + detail)
+        print("Team control preflight requires attention: " + detail
+              + "\nUse in-session doctor and the normal approval flow if available.", file=sys.stderr)
 
 
 def run_pane(directory, name):
@@ -322,8 +468,10 @@ def run_pane(directory, name):
     args, env = command(state["tool"], state["config"], "tmux", worker,
                         extra=() if worker else state["extra"], brief=brief, budget=state["budget"])
     try:
+        if state["tool"] == "codex":
+            codex_preflight(args, env, state["cwd"])
         code = subprocess.call(args, env=env, cwd=state["cwd"])
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         code = 127
     finally:
@@ -367,11 +515,17 @@ def control(argv):
     wait = subs.add_parser("wait")
     wait.add_argument("--timeout", type=int, default=30)
     subs.add_parser("status")
+    subs.add_parser("doctor", help="Check team control from the current execution context")
     stop = subs.add_parser("stop")
     stop.add_argument("name")
     args = parser.parse_args(argv)
     directory = state_dir()
     role = os.environ.get("AGENT_TEAM_ROLE", "lead")
+    if args.action == "doctor":
+        print(json.dumps(probe(read(directory / "state.json"), role)))
+        return
+    if args.action in ("spawn", "stop") or (args.action == "send" and args.wake):
+        probe(read(directory / "state.json"), role)
     if args.action == "wait":
         deadline = time.monotonic() + min(max(args.timeout, 0), 60)
         while True:
@@ -412,7 +566,7 @@ def control(argv):
             target = args.name if args.action == "send" else "lead"
             if target not in state["members"]:
                 fail("Unknown recipient")
-            message = {"id": state["next_message"], "from": role, "to": target, "text": Path(args.file).read_text(), "type": args.action}
+            message = {"id": state["next_message"], "from": role, "to": target, "text": Path(args.file).read_text(), "type": args.action, "timestamp": time.time()}
             state["next_message"] += 1
             state["messages"].append(message)
             if args.action == "report":
@@ -466,7 +620,7 @@ def main():
     if argv[0] in ("-h", "--help"):
         print("Usage: agent-team [--tmux]  # choose a coding agent interactively\n"
               "       agent-team <codex|traex|opencode|claude> [--team-budget] [--tmux] [CLI args]\n"
-              "       agent-team <spawn|send|report|receive|wait|status|stop> --help\n"
+              "       agent-team <spawn|send|report|receive|wait|status|stop|doctor> --help\n"
               "Default: native subagents. --tmux: interactive pane workers only.\n"
               "--team-dry-run prints the launch plan without starting an agent.\n"
               "Configure combinations in $XDG_CONFIG_HOME/agent-team/config.json.")
