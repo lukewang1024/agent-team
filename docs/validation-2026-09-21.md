@@ -35,3 +35,33 @@ Remaining acceptance gates:
 The native model rule is instruction-level, not a hard API-level restriction.
 The current report does not establish model quality or cost savings. Other
 coding agents have adapter tests, not new real-model acceptance results.
+
+## Diagnosed causes and controlled confirmation (22:37)
+
+The earlier connection failures were caused by the test process environment,
+not established provider downtime. The parent Codex process has an existing
+localhost HTTP proxy, but its shell_environment_policy.inherit=core removes
+proxy variables before starting agent-team. The launcher copies that already
+filtered environment. A direct unauthenticated HTTPS probe timed out; the same
+probe through the existing proxy completed TLS and returned the expected 401.
+
+Restoring only those existing proxy variables for the diagnostic subprocess
+made the native budget test finish in about 33 seconds, exit 0. Actual child
+session metadata confirmed Astra Medium for the lead and Luna High for both
+fresh-context workers. Answers 323 and 667 were correct. This validates basic
+budget routing; it is not a coding-quality or cost comparison. No global proxy
+configuration was changed.
+
+The tmux failure is independent: a minimal AF_UNIX connection to the same socket
+with UID 1001 and mode 0660 succeeds outside the sandbox (connect_ex=0) and fails
+in Codex :workspace (connect_ex=1, EPERM). Filesystem permissions and cwd are not
+the cause. The previous test explicitly selected approval never, preventing the
+normal approval route. Restoring HTTP proxies does not grant socket access.
+The user's interactive zsh codex function also adds --approve-for-me by default;
+agent-team invokes the executable directly and does not inherit shell functions.
+
+Next steps should preserve the existing environment deliberately for child CLI
+launches, and validate tmux with an explicitly chosen normal approval policy for
+both lead and worker sessions. Preflight is diagnostic; it does not make a
+socket-denied, approval-never policy compatible with pane workers. No silent
+sandbox relaxation or unapproved fallback should be added.
