@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""Native team launch adapters and an opt-in interactive tmux team controller."""
+import argparse
+import contextlib
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG = ROOT / "config"
+TOOLS = ("codex", "traex", "opencode", "claude")
+
+
+def fail(message):
+    raise RuntimeError(message)
+
+
+def read(path):
+    return json.loads(Path(path).read_text())
+
+
+def write(path, value):
+    path = Path(path)
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+    temp.chmod(0o600)
+    temp.replace(path)
+
+
+def merge(base, extra):
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def settings(tool, budget):
+    config = read(CONFIG / "teams.json")
+    value = config[tool]["budget" if budget else "team"].copy()
+    # Existing personal Codex profiles remain optional compatibility overrides.
+    if tool == "codex":
+        import tomllib
+        profile = "team-budget" if budget else "team"
+        home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+        path = home / (profile + ".config.toml")
+        if path.exists():
+            native = tomllib.loads(path.read_text())
+            mapping = {"model": "model", "model_reasoning_effort": "effort"}
+            for source, target in mapping.items():
+                if source in native:
+                    value[target] = native[source]
+            agents = native.get("agents", {})
+            for source, target in [("default_subagent_model", "worker_model"),
+                                   ("default_subagent_reasoning_effort", "worker_effort"),
+                                   ("max_concurrent_threads_per_session", "limit")]:
+                if source in agents:
+                    value[target] = agents[source]
+    override = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-team/config.json"
+    if override.exists():
+        merge(value, read(override).get(tool, {}).get("budget" if budget else "team", {}))
+    value.setdefault("limit", 2)
+    if not isinstance(value["limit"], int) or not 1 <= value["limit"] <= 2:
+        fail("Team limit must be 1 or 2")
+    for key in ("model", "effort", "worker_model", "worker_effort"):
+        if value.get(key) is not None and not isinstance(value[key], str):
+            fail(f"{key} must be a string or null")
+    for key in ("args", "worker_args"):
+        if key in value and (not isinstance(value[key], list) or not all(isinstance(v, str) for v in value[key])):
+            fail(f"{key} must be an array of CLI argument strings")
+    return value
+
+
+def instructions(mode, worker=False):
+    common = (CONFIG / "team-rules.md").read_text()
+    if worker:
+        return "You are a team worker. Do not spawn agents. Follow your assigned brief.\n" + (CONFIG / "team-pane.md").read_text() + common
+    marker = "Team delegation mode is enabled.\n" + common
+    if mode == "tmux":
+        marker += "\nPane team mode is enabled. Never use native subagents.\n" + (CONFIG / "team-pane.md").read_text()
+    else:
+        marker += "\nNative team mode: use native delegation only, never create panes. "
+        marker += "Use team-worker when this adapter provides that agent type."
+    return marker
+
+
+def command(tool, cfg, mode, worker=False, extra=(), brief=None, budget=False):
+    env = os.environ.copy()
+    prompt = instructions(mode, worker)
+    if mode == "tmux" and os.environ.get("AGENT_TEAM_DIR"):
+        prefix = shlex.join(["env", "AGENT_TEAM_DIR=" + os.environ["AGENT_TEAM_DIR"],
+                             "AGENT_TEAM_ROLE=" + os.environ.get("AGENT_TEAM_ROLE", "lead"), "agent-team"])
+        prompt += "\nYour team command prefix (also works if the tool strips inherited environment): " + prefix
+    model = cfg.get("worker_model", cfg.get("model")) if worker else cfg.get("model")
+    effort = cfg.get("worker_effort", cfg.get("effort")) if worker else cfg.get("effort")
+    disabled = mode == "tmux" or worker
+    args = [tool]
+    if tool in ("codex", "traex"):
+        if tool == "codex" and not worker:
+            profile = "team-budget" if budget else "team"
+            home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+            if (home / (profile + ".config.toml")).exists():
+                args += ["--profile", profile]
+        args += ["-c", "developer_instructions=" + json.dumps(prompt)]
+        if tool == "codex":
+            args += ["-c", "agents.enabled=" + ("false" if disabled else "true")]
+        else:
+            args += ["--disable" if disabled else "--enable", "multi_agent"]
+            args += ["--disable" if disabled else "--enable", "multi_agent_v2"]
+        if not disabled:
+            if tool == "codex":
+                args += ["-c", "agents.max_concurrent_threads_per_session=" + str(cfg["limit"])]
+                for key, dest in [("worker_model", "default_subagent_model"), ("worker_effort", "default_subagent_reasoning_effort")]:
+                    if cfg.get(key):
+                        args += ["-c", "agents." + dest + "=" + json.dumps(cfg[key])]
+            elif cfg.get("worker_model") or cfg.get("worker_effort"):
+                role = 'developer_instructions = "Do not spawn agents. Return evidence and validation results."\n'
+                for key, dest in [("worker_model", "model"), ("worker_effort", "model_reasoning_effort")]:
+                    if cfg.get(key):
+                        role += dest + " = " + json.dumps(cfg[key]) + "\n"
+                cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "agent-team"
+                cache.mkdir(parents=True, exist_ok=True)
+                path = cache / ("traex-" + hashlib.sha256(role.encode()).hexdigest() + ".toml")
+                path.write_text(role)
+                args += ["-c", "agents.team-worker.description=" + json.dumps("Independent team work using the selected worker combination")]
+                args += ["-c", "agents.team-worker.config_file=" + json.dumps(str(path))]
+        if model:
+            args += ["-m", model]
+        if effort:
+            args += ["-c", "model_reasoning_effort=" + json.dumps(effort)]
+    elif tool == "claude":
+        env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "0"
+        args += ["--append-system-prompt", prompt]
+        if disabled:
+            args += ["--disallowedTools", "Agent,Task"]
+        else:
+            definition = {"description": "Bounded team work; use for independent delegated tasks", "prompt": "Do not spawn agents. Return evidence and validation results.", "model": cfg.get("worker_model") or "inherit"}
+            if cfg.get("worker_effort"):
+                definition["effort"] = cfg["worker_effort"]
+            args += ["--agents", json.dumps({"team-worker": definition})]
+        if model:
+            args += ["--model", model]
+        if effort:
+            args += ["--effort", effort]
+    else:
+        content = json.loads(env.get("OPENCODE_CONFIG_CONTENT", "{}"))
+        lead = {"mode": "primary", "prompt": prompt}
+        if model:
+            lead["model"] = model
+        if effort:
+            lead["reasoningEffort"] = effort
+        if disabled:
+            lead["permission"] = {"task": "deny"}
+        agents = {"team-lead": lead}
+        if not disabled:
+            sub = {"mode": "subagent", "description": "Bounded independent team work", "prompt": "Do not delegate. Return evidence and validation results.", "permission": {"task": "deny"}}
+            if cfg.get("worker_model"):
+                sub["model"] = cfg["worker_model"]
+            if cfg.get("worker_effort"):
+                sub["reasoningEffort"] = cfg["worker_effort"]
+            agents["team-worker"] = sub
+        merge(content, {"agent": agents})
+        if disabled:
+            permission = content.get("permission")
+            if isinstance(permission, str):
+                content["permission"] = {"*": permission, "task": "deny"}
+            else:
+                content.setdefault("permission", {})["task"] = "deny"
+        env["OPENCODE_CONFIG_CONTENT"] = json.dumps(content)
+        args += ["--agent", "team-lead"]
+    args += cfg.get("worker_args" if worker else "args", [])
+    args += list(extra)
+    if brief:
+        if tool == "opencode":
+            args += ["--prompt", brief]
+        else:
+            args += ["--", brief]
+    return args, env
+
+
+def tmux(*args, data=None, check=True):
+    result = subprocess.run(["tmux", *args], input=data, text=True, capture_output=True)
+    if check and result.returncode:
+        fail(result.stderr.strip() or "tmux command failed")
+    return result.stdout.strip()
+
+
+def state_dir():
+    value = os.environ.get("AGENT_TEAM_DIR")
+    if not value:
+        fail("This command must run inside a --tmux team session")
+    return Path(value)
+
+
+@contextlib.contextmanager
+def locked(directory):
+    import fcntl
+    with (directory / "lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read(directory / "state.json")
+        yield state
+        write(directory / "state.json", state)
+
+
+def owned(state, pane):
+    return tmux("show-options", "-p", "-v", "-t", pane, "@agent_team", check=False) == state["id"]
+
+
+def layout(state):
+    tmux("select-layout", "-t", state["window"], "main-vertical")
+
+
+def runner(directory, name):
+    return shlex.join([sys.executable, str(Path(__file__).resolve()), "run-pane", str(directory), name])
+
+
+def launch(tool, argv):
+    budget = False
+    pane_mode = False
+    dry = False
+    forwarded = []
+    literal = False
+    for arg in argv:
+        if arg == "--":
+            literal = True
+            forwarded.append(arg)
+            continue
+        if literal:
+            forwarded.append(arg)
+            continue
+        if arg == "--team-budget":
+            budget = True
+        elif arg == "--tmux":
+            pane_mode = True
+        elif arg == "--team-dry-run":
+            dry = True
+        else:
+            forwarded.append(arg)
+    cfg = settings(tool, budget)
+    mode = "tmux" if pane_mode else "native"
+    forbidden = {"--remote"}
+    forbidden.update({"-p", "--print", "--background", "--bg"} if tool == "claude" else {"exec", "run", "attach", "serve"})
+    if pane_mode and any(x in forbidden for x in forwarded):
+        fail("--tmux team mode requires a local interactive session")
+    args, env = command(tool, cfg, mode, extra=forwarded, budget=budget)
+    if dry:
+        print(json.dumps({"tool": tool, "mode": mode, "config": cfg, "argv": args}, ensure_ascii=False, indent=2))
+        return
+    if not shutil.which(tool):
+        fail(f"CLI is not installed: {tool}")
+    if not pane_mode:
+        return os.execvpe(args[0], args, env)
+    if not shutil.which("tmux"):
+        fail("--tmux requires tmux")
+    ident = uuid.uuid4().hex[:12]
+    base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "agent-team"
+    directory = base / ident
+    directory.mkdir(parents=True, mode=0o700)
+    state = {"id": ident, "tool": tool, "config": cfg, "budget": budget,
+             "cwd": os.getcwd(), "extra": forwarded, "members": {}, "messages": [], "next_message": 1}
+    write(directory / "state.json", state)
+    shell_command = runner(directory, "lead")
+    environment = []
+    for key in ("PATH", "CODEX_HOME", "TRAE_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"):
+        if key in os.environ:
+            environment += ["-e", key + "=" + os.environ[key]]
+    try:
+        if os.environ.get("TMUX"):
+            target = os.environ.get("TMUX_PANE")
+            if not target:
+                fail("TMUX_PANE is required to identify the launch window")
+            session = tmux("display-message", "-p", "-t", target, "#{session_id}")
+            info = tmux("new-window", "-d", "-P", "-F", "#{window_id} #{pane_id}", "-t", session, "-n", tool + "-team", "-c", state["cwd"], *environment, shell_command)
+        else:
+            info = tmux("new-session", "-d", "-P", "-F", "#{window_id} #{pane_id}", "-s", "team-" + ident, "-c", state["cwd"], *environment, shell_command)
+        window, pane = info.split()
+        with locked(directory) as state:
+            state["window"] = window
+            state["members"]["lead"] = {"pane": pane, "status": "running", "cursor": 0}
+            tmux("set-option", "-p", "-t", pane, "@agent_team", ident)
+            tmux("set-option", "-w", "-t", window, "remain-on-exit", "off")
+            tmux("set-option", "-w", "-t", window, "pane-border-status", "top")
+            tmux("select-pane", "-t", pane, "-T", "lead")
+            tmux("set-option", "-w", "-t", window, "pane-border-format", " #{pane_title} ")
+        (directory / "ready").touch()
+        if os.environ.get("TMUX"):
+            tmux("select-window", "-t", window)
+            print(f"Team {ident}: {window}; state: {directory}")
+        else:
+            subprocess.run(["tmux", "attach-session", "-t", "team-" + ident], check=True)
+    except BaseException:
+        (directory / "failed").touch()
+        raise
+
+
+def run_pane(directory, name):
+    directory = Path(directory)
+    deadline = time.monotonic() + 15
+    while not (directory / "ready").exists():
+        if (directory / "failed").exists() or time.monotonic() > deadline:
+            fail("Team initialization failed")
+        time.sleep(0.05)
+    state = read(directory / "state.json")
+    while name not in state["members"]:
+        if time.monotonic() > deadline:
+            fail("Worker registration failed")
+        time.sleep(0.05)
+        state = read(directory / "state.json")
+    os.environ["AGENT_TEAM_DIR"] = str(directory)
+    os.environ["AGENT_TEAM_ROLE"] = name
+    worker = name != "lead"
+    brief = state["members"][name].get("brief") if worker else None
+    args, env = command(state["tool"], state["config"], "tmux", worker,
+                        extra=() if worker else state["extra"], brief=brief, budget=state["budget"])
+    try:
+        code = subprocess.call(args, env=env, cwd=state["cwd"])
+    except OSError as exc:
+        print(str(exc), file=sys.stderr)
+        code = 127
+    finally:
+        with locked(directory) as current:
+            current["members"][name]["status"] = "exited"
+            if not worker:
+                current["closed"] = True
+                for member, item in current["members"].items():
+                    if member != "lead" and owned(current, item["pane"]):
+                        tmux("kill-pane", "-t", item["pane"], check=False)
+    return code
+
+
+def wake(state, target):
+    item = state["members"][target]
+    if not owned(state, item["pane"]):
+        fail("Target pane has exited or is no longer owned by this team")
+    buffer = "team-" + uuid.uuid4().hex
+    tmux("load-buffer", "-b", buffer, "-", data="A team message is waiting. Run agent-team receive and handle it.")
+    try:
+        tmux("paste-buffer", "-p", "-d", "-b", buffer, "-t", item["pane"])
+        tmux("send-keys", "-t", item["pane"], "Enter")
+    finally:
+        tmux("delete-buffer", "-b", buffer, check=False)
+
+
+def control(argv):
+    parser = argparse.ArgumentParser(description="Interactive pane team control; requires AGENT_TEAM_DIR")
+    subs = parser.add_subparsers(dest="action", required=True)
+    spawn = subs.add_parser("spawn")
+    spawn.add_argument("name")
+    spawn.add_argument("--file", required=True, help="UTF-8 task brief")
+    send = subs.add_parser("send")
+    send.add_argument("name")
+    send.add_argument("--file", required=True)
+    send.add_argument("--wake", action="store_true", help="Submit a notice to an idle pane; do not use while someone is typing")
+    report = subs.add_parser("report")
+    report.add_argument("--file", required=True)
+    report.add_argument("--status", choices=["ready", "blocked"], default="ready")
+    subs.add_parser("receive")
+    wait = subs.add_parser("wait")
+    wait.add_argument("--timeout", type=int, default=30)
+    subs.add_parser("status")
+    stop = subs.add_parser("stop")
+    stop.add_argument("name")
+    args = parser.parse_args(argv)
+    directory = state_dir()
+    role = os.environ.get("AGENT_TEAM_ROLE", "lead")
+    if args.action == "wait":
+        deadline = time.monotonic() + min(max(args.timeout, 0), 60)
+        while True:
+            state = read(directory / "state.json")
+            cursor = state["members"][role].get("cursor", 0)
+            if any(m["to"] == role and m["id"] > cursor for m in state["messages"]) or time.monotonic() >= deadline or state.get("closed"):
+                args.action = "receive"
+                break
+            time.sleep(0.2)
+    with locked(directory) as state:
+        if role not in state["members"]:
+            fail("Unknown team member")
+        if state.get("closed") and args.action not in ("status", "receive"):
+            fail("Team is closed")
+        if args.action == "spawn":
+            if role != "lead":
+                fail("Only the lead may spawn workers")
+            if not re.fullmatch(r"[a-z][a-z0-9_-]{0,39}", args.name) or args.name == "lead":
+                fail("Worker name must be a lowercase identifier other than lead")
+            if args.name in state["members"]:
+                fail("Member already exists; use send for follow-up work")
+            active = [m for n, m in state["members"].items() if n != "lead" and owned(state, m["pane"])]
+            if len(active) >= state["config"]["limit"]:
+                fail("Worker limit reached; reuse or stop an existing worker")
+            brief = Path(args.file).read_text()
+            pane = tmux("split-window", "-d", "-P", "-F", "#{pane_id}", "-t", state["members"]["lead"]["pane"], "-c", state["cwd"], runner(directory, args.name))
+            try:
+                tmux("set-option", "-p", "-t", pane, "@agent_team", state["id"])
+                tmux("select-pane", "-t", pane, "-T", args.name)
+                state["members"][args.name] = {"pane": pane, "status": "running", "cursor": 0, "brief": brief}
+                layout(state)
+            except BaseException:
+                tmux("kill-pane", "-t", pane, check=False)
+                state["members"].pop(args.name, None)
+                raise
+            print(json.dumps({"name": args.name, "pane": pane}))
+        elif args.action in ("send", "report"):
+            target = args.name if args.action == "send" else "lead"
+            if target not in state["members"]:
+                fail("Unknown recipient")
+            message = {"id": state["next_message"], "from": role, "to": target, "text": Path(args.file).read_text(), "type": args.action}
+            state["next_message"] += 1
+            state["messages"].append(message)
+            if args.action == "report":
+                state["members"][role]["status"] = args.status
+            write(directory / "state.json", state)
+            if args.action == "send" and args.wake:
+                if state["members"][target]["status"] not in ("ready", "blocked"):
+                    fail("Message queued, but target is not idle; receive it during current work")
+                wake(state, target)
+                state["members"][target]["status"] = "running"
+            print(json.dumps({"queued": message["id"], "to": target}))
+        elif args.action == "receive":
+            cursor = state["members"][role].get("cursor", 0)
+            messages = [m for m in state["messages"] if m["to"] == role and m["id"] > cursor]
+            if messages:
+                state["members"][role]["cursor"] = messages[-1]["id"]
+            print(json.dumps(messages, ensure_ascii=False))
+        elif args.action == "status":
+            print(json.dumps({n: {"pane": m["pane"], "status": m["status"], "alive": owned(state, m["pane"])} for n, m in state["members"].items()}, indent=2))
+        elif args.action == "stop":
+            if role != "lead" or args.name == "lead":
+                fail("Only the lead may stop workers")
+            item = state["members"].get(args.name)
+            if not item:
+                fail("Unknown member")
+            if owned(state, item["pane"]):
+                tmux("kill-pane", "-t", item["pane"])
+            item["status"] = "stopped"
+            layout(state)
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv == ["--tmux"]:
+        if not sys.stdin.isatty():
+            fail("Choose a CLI explicitly: agent-team <codex|traex|opencode|claude> [--tmux]")
+        available = [tool for tool in TOOLS if shutil.which(tool)]
+        if not available:
+            fail("No supported coding agent is installed")
+        for number, tool in enumerate(available, 1):
+            print(f"{number}. {tool}")
+        choice = input("Coding agent [1]: ").strip() or "1"
+        if not choice.isdigit() or not 1 <= int(choice) <= len(available):
+            fail("Invalid agent selection")
+        preset = input("Preset: 1. team  2. budget [1]: ").strip() or "1"
+        if preset not in ("1", "2"):
+            fail("Invalid preset selection")
+        return launch(available[int(choice) - 1], argv + (["--team-budget"] if preset == "2" else []))
+    if argv[0] in TOOLS:
+        return launch(argv[0], argv[1:])
+    if argv[0] in ("-h", "--help"):
+        print("Usage: agent-team [--tmux]  # choose a coding agent interactively\n"
+              "       agent-team <codex|traex|opencode|claude> [--team-budget] [--tmux] [CLI args]\n"
+              "       agent-team <spawn|send|report|receive|wait|status|stop> --help\n"
+              "Default: native subagents. --tmux: interactive pane workers only.\n"
+              "--team-dry-run prints the launch plan without starting an agent.\n"
+              "Configure combinations in $XDG_CONFIG_HOME/agent-team/config.json.")
+        return
+    if len(sys.argv) > 2 and sys.argv[1] == "launch":
+        if sys.argv[2] not in TOOLS:
+            fail("Unsupported CLI")
+        return launch(sys.argv[2], sys.argv[3:])
+    if len(sys.argv) == 4 and sys.argv[1] == "run-pane":
+        return run_pane(sys.argv[2], sys.argv[3])
+    return control(sys.argv[1:])
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main() or 0)
+    except (RuntimeError, OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
+        print("agent-team: " + str(exc), file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,28 @@
+{
+  "codex": {
+    "team": {
+      "model": "gpt-6-astra",
+      "effort": "medium",
+      "worker_model": "gpt-6-astra",
+      "worker_effort": "low"
+    },
+    "budget": {
+      "model": "gpt-6-astra",
+      "effort": "medium",
+      "worker_model": "gpt-5.6-luna",
+      "worker_effort": "high"
+    }
+  },
+  "traex": {
+    "team": {},
+    "budget": {}
+  },
+  "opencode": {
+    "team": {},
+    "budget": {}
+  },
+  "claude": {
+    "team": {},
+    "budget": {}
+  }
+}
