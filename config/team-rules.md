@@ -14,9 +14,8 @@ limit) and keep delegation one level deep: subagents do not spawn further agents
 The main session selects one execution mode at startup. By default use native
 subagents only, without tmux panes. With explicit `--tmux`, use only interactive
 pane workers through `agent-team`, following the injected pane protocol. Do not
-mix the two modes or migrate running members between them. The pane mode is an
-explicit exception to the applicable workbench/dev-server pane rules; it
-uses a dedicated team window and does not alter repository inspection windows.
+mix the two modes or migrate running members between them. Opt-in pane mode
+uses a dedicated team window and leaves existing windows and panes unchanged.
 
 Use the configured subagent model and reasoning effort, independently of the
 primary agent's settings. These combinations are user-customizable; no model

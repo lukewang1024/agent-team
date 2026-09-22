@@ -3,10 +3,30 @@
 Select a coding agent, configure primary/worker model combinations, and run
 native subagents or an interactive tmux team.
 
+## Project boundary
+
+This repository owns reusable coding-agent adapters, configurable model presets,
+collaboration instructions and the native/tmux execution modes. It does not
+require dotfiles, tmux-agent-workbench, a particular checkout location, or a
+specific GitHub account at runtime. Native mode does not require tmux.
+
+A terminal workbench can offer launch entries that invoke these commands.
+Personal model overrides, proxy environment, approval preferences and shell
+shortcuts belong in the user's configuration or dotfiles. The CLI does not
+infer them from shell functions or silently change permissions.
+
 ## Install
 
 Requires Python 3.11+, at least one supported coding CLI, and tmux for pane mode.
-Run `python3 install.py` from this checkout to link the commands into `~/.local/bin`.
+Clone the repository and install the entrypoints:
+
+```sh
+git clone https://github.com/lukewang1024/agent-team.git
+cd agent-team
+python3 install.py
+```
+
+The installer links the commands into `~/.local/bin`; ensure it is on `PATH`.
 The installer refuses to overwrite unrelated files. Keep the checkout in place.
 It does not change authentication, global CLI configuration, or permission defaults.
 
@@ -42,8 +62,8 @@ mode the controller enforces the pane cap and disables native delegation.
 Tmux mode creates one dedicated window (or a new session when outside tmux).
 The lead is left, workers are stacked right: `main-vertical`, corresponding to
 prefix + Alt+4. Workers are actual interactive CLIs, not transcript viewers.
-Switch panes to inspect progress or interact. No workbench inspection panes are
-reused. Native and pane members never mix in the same team. Team management uses
+Switch panes to inspect progress or interact. Existing windows and panes are
+left unchanged. Native and pane members never mix in the same team. Team management uses
 spawn, send, receive, report, wait, status and stop commands; see
 [the pane protocol](config/team-pane.md). Messages persist in a local mailbox. They are
 read at checkpoints or through a bounded wait, not pushed through a tool-native
@@ -73,8 +93,10 @@ assumed budget model: configure a distinct budget combination when desired.
 There is no automatic budget switching.
 
 Codex additionally reads the existing `team.config.toml` / `team-budget.config.toml`
-profiles in CODEX_HOME (default `~/.codex`); their model combinations remain Astra
-Medium + Astra Low and Astra Medium + Luna High. The JSON override, when present,
+profiles in CODEX_HOME (default `~/.codex`), when present. No personal profile
+is required. The bundled Codex presets are Astra Medium + Astra Low and Astra
+Medium + Luna High; replace them if your provider uses other model identifiers.
+The JSON override, when present,
 takes precedence for team settings. Command-line options passed to the lead only
 affect the lead; use worker_args or worker_model/worker_effort for child settings.
 The controller injects [shared team rules](config/team-rules.md) into each supported tool, including

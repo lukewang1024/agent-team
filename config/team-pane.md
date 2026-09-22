@@ -7,8 +7,8 @@ are stacked on the right (main-vertical / prefix + Alt+4).
 
 Use `agent-team` through the shell tool. It reads AGENT_TEAM_DIR and
 AGENT_TEAM_ROLE from the environment. If the environment is unavailable, report
-the error rather than creating an unrelated session. Instructions below are the
-pane-mode exception to the ordinary prohibition on creating agent tmux panes.
+the error rather than creating an unrelated session. Create worker panes only
+in the dedicated team window established by the explicit --tmux launch.
 
 Lead workflow:
 
