@@ -70,6 +70,8 @@ mode the controller enforces the pane cap and disables native delegation.
 Tmux mode creates one dedicated window (or a new session when outside tmux).
 The lead is left, workers are stacked right: `main-vertical`, corresponding to
 prefix + Alt+4. Workers are actual interactive CLIs, not transcript viewers.
+Pane headers keep a fixed `lead |` or `worker |` prefix before the live terminal
+title, so application title updates cannot erase the role.
 Switch panes to inspect progress or interact. Existing windows and panes are
 left unchanged. Native and pane members never mix in the same team. Team management uses
 spawn, send, receive, report, wait, status and stop commands; see

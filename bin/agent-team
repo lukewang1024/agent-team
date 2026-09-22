@@ -17,6 +17,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "config"
 TOOLS = ("codex", "traex", "opencode", "claude")
+TEAM_BORDER_FORMAT = " #{?@agent_team_role,#{@agent_team_role} | ,}#{pane_title} "
 
 
 def fail(message):
@@ -382,10 +383,11 @@ def launch(tool, argv):
             state["window"] = window
             state["members"]["lead"] = {"pane": pane, "status": "running", "cursor": 0}
             tmux("set-option", "-p", "-t", pane, "@agent_team", ident)
+            tmux("set-option", "-p", "-t", pane, "@agent_team_role", "lead")
             tmux("set-option", "-w", "-t", window, "remain-on-exit", "off")
             tmux("set-option", "-w", "-t", window, "pane-border-status", "top")
             tmux("select-pane", "-t", pane, "-T", "lead")
-            tmux("set-option", "-w", "-t", window, "pane-border-format", " #{pane_title} ")
+            tmux("set-option", "-w", "-t", window, "pane-border-format", TEAM_BORDER_FORMAT)
         (directory / "ready").touch()
         if os.environ.get("TMUX"):
             tmux("select-window", "-t", window)
@@ -575,6 +577,7 @@ def control(argv):
             pane = tmux("split-window", "-d", "-P", "-F", "#{pane_id}", "-t", state["members"]["lead"]["pane"], "-c", state["cwd"], runner(directory, args.name))
             try:
                 tmux("set-option", "-p", "-t", pane, "@agent_team", state["id"])
+                tmux("set-option", "-p", "-t", pane, "@agent_team_role", "worker")
                 tmux("select-pane", "-t", pane, "-T", args.name)
                 state["members"][args.name] = {"pane": pane, "status": "running", "cursor": 0, "brief": brief}
                 layout(state)

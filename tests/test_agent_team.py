@@ -263,6 +263,17 @@ class PaneTests(unittest.TestCase):
         self.control('stop', 'two')
         self.assertEqual(self.state()['members']['two']['status'], 'stopped')
 
+    def test_role_prefix_survives_application_title_updates(self):
+        self.spawn('one')
+        for name, role in [('lead', 'lead'), ('one', 'worker')]:
+            pane = self.state()['members'][name]['pane']
+            command = [self.real_tmux, '-L', self.socket]
+            for title in ['Action Required | task', 'Working | new title']:
+                subprocess.run(command + ['select-pane', '-t', pane, '-T', title], check=True)
+                rendered = subprocess.check_output(command + ['display-message', '-p', '-t', pane,
+                                                    '#{E:pane-border-format}'], text=True).strip()
+                self.assertEqual(rendered, role + ' | ' + title)
+
     def test_doctor_and_denied_spawn_preserve_members(self):
         self.assertTrue(json.loads(self.control('doctor'))['ok'])
         before = self.state()
