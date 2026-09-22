@@ -112,8 +112,36 @@ class AdapterTests(unittest.TestCase):
                     else:
                         lead = json.loads(env['OPENCODE_CONFIG_CONTENT'])['agent']['team-lead']
                         self.assertEqual(lead.get('permission', {}).get('task'), 'deny' if mode == 'tmux' else None)
-                    self.assertNotIn('--dangerously-bypass-approvals-and-sandbox', args)
-                    self.assertNotIn('--dangerously-skip-permissions', args)
+                    if tool in ('codex', 'traex'):
+                        self.assertIn('--dangerously-bypass-approvals-and-sandbox', args)
+                    elif tool == 'claude':
+                        self.assertIn('--dangerously-skip-permissions', args)
+
+    def test_yolo_defaults_and_opt_out_cover_every_member(self):
+        for tool in TEAM.TOOLS:
+            for mode in ('native', 'tmux'):
+                for worker in (False, True):
+                    for yolo in (False, True):
+                        with self.subTest(tool=tool, mode=mode, worker=worker, yolo=yolo):
+                            args, env = TEAM.command(tool, {'limit': 2, 'yolo': yolo}, mode, worker=worker)
+                            if tool == 'opencode':
+                                cfg = json.loads(env['OPENCODE_CONFIG_CONTENT'])
+                                lead = cfg['agent']['team-lead']
+                                self.assertEqual(lead.get('permission', {}).get('*') == 'allow', yolo)
+                                if mode == 'tmux' or worker:
+                                    self.assertEqual(lead['permission']['task'], 'deny')
+                                elif yolo:
+                                    self.assertEqual(cfg['agent']['team-worker']['permission'], {'*': 'allow', 'task': 'deny'})
+                            else:
+                                flag = '--dangerously-skip-permissions' if tool == 'claude' else '--dangerously-bypass-approvals-and-sandbox'
+                                self.assertEqual(flag in args, yolo)
+
+    def test_no_yolo_wrapper_flag_and_literal_prompt(self):
+        with patch.object(TEAM, 'settings', return_value={'limit': 2}), patch.object(TEAM.os, 'execvpe') as execute:
+            TEAM.launch('codex', ['--no-yolo', '--', '--no-yolo'])
+        args = execute.call_args.args[1]
+        self.assertNotIn('--dangerously-bypass-approvals-and-sandbox', args)
+        self.assertEqual(args[-2:], ['--', '--no-yolo'])
 
     def test_worker_uses_own_model_and_cannot_delegate(self):
         for tool in TEAM.TOOLS:

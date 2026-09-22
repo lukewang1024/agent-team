@@ -68,6 +68,9 @@ def settings(tool, budget):
     override = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-team/config.json"
     if override.exists():
         merge(value, read(override).get(tool, {}).get("budget" if budget else "team", {}))
+    value.setdefault("yolo", True)
+    if not isinstance(value["yolo"], bool):
+        fail("yolo must be a boolean")
     value.setdefault("limit", 2)
     if not isinstance(value["limit"], int) or not 1 <= value["limit"] <= 2:
         fail("Team limit must be 1 or 2")
@@ -118,6 +121,11 @@ def command(tool, cfg, mode, worker=False, extra=(), brief=None, budget=False):
     effort = cfg.get("worker_effort", cfg.get("effort")) if worker else cfg.get("effort")
     disabled = mode == "tmux" or worker
     args = [tool]
+    yolo = cfg.get("yolo", True)
+    if yolo and tool in ("codex", "traex"):
+        args.append("--dangerously-bypass-approvals-and-sandbox")
+    elif yolo and tool == "claude":
+        args.append("--dangerously-skip-permissions")
     if tool in ("codex", "traex"):
         if tool == "codex" and not worker:
             profile = "team-budget" if budget else "team"
@@ -182,7 +190,15 @@ def command(tool, cfg, mode, worker=False, extra=(), brief=None, budget=False):
             if cfg.get("worker_effort"):
                 sub["reasoningEffort"] = cfg["worker_effort"]
             agents["team-worker"] = sub
+        if yolo:
+            for definition in agents.values():
+                definition["permission"] = {"*": "allow", **definition.get("permission", {})}
         merge(content, {"agent": agents})
+        if yolo:
+            # Replace stale per-agent overrides as well as the global default.
+            content["permission"] = "allow"
+            for name, definition in agents.items():
+                content["agent"][name]["permission"] = definition["permission"]
         if disabled:
             permission = content.get("permission")
             if isinstance(permission, str):
@@ -290,6 +306,7 @@ def launch(tool, argv):
     budget = False
     pane_mode = False
     dry = False
+    no_yolo = False
     forwarded = []
     literal = False
     for arg in argv:
@@ -304,11 +321,15 @@ def launch(tool, argv):
             budget = True
         elif arg == "--tmux":
             pane_mode = True
+        elif arg == "--no-yolo":
+            no_yolo = True
         elif arg == "--team-dry-run":
             dry = True
         else:
             forwarded.append(arg)
     cfg = settings(tool, budget)
+    if no_yolo:
+        cfg["yolo"] = False
     mode = "tmux" if pane_mode else "native"
     forbidden = {"--remote"}
     forbidden.update({"-p", "--print", "--background", "--bg"} if tool == "claude" else {"exec", "run", "attach", "serve"})
@@ -621,7 +642,7 @@ def main():
         print("Usage: agent-team [--tmux]  # choose a coding agent interactively\n"
               "       agent-team <codex|traex|opencode|claude> [--team-budget] [--tmux] [CLI args]\n"
               "       agent-team <spawn|send|report|receive|wait|status|stop|doctor> --help\n"
-              "Default: native subagents. --tmux: interactive pane workers only.\n"
+              "Default: YOLO and native subagents. --no-yolo inherits CLI permissions. --tmux: interactive pane workers only.\n"
               "--team-dry-run prints the launch plan without starting an agent.\n"
               "Configure combinations in $XDG_CONFIG_HOME/agent-team/config.json.")
         return

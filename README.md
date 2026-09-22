@@ -13,7 +13,7 @@ specific GitHub account at runtime. Native mode does not require tmux.
 A terminal workbench can offer launch entries that invoke these commands.
 Personal model overrides, proxy environment, approval preferences and shell
 shortcuts belong in the user's configuration or dotfiles. The CLI does not
-infer them from shell functions or silently change permissions.
+infer them from shell functions. Team launches explicitly default to YOLO, as described below.
 
 ## Install
 
@@ -28,7 +28,7 @@ python3 install.py
 
 The installer links the commands into `~/.local/bin`; ensure it is on `PATH`.
 The installer refuses to overwrite unrelated files. Keep the checkout in place.
-It does not change authentication, global CLI configuration, or permission defaults.
+It does not change authentication, global CLI configuration, or global permission defaults.
 
 ## Usage
 
@@ -51,7 +51,15 @@ Equivalent `traex-team`, `opencode-team`, and `claude-team` shortcuts and their
 `-budget` forms are installed by `python3 install.py`. All launch the same controller.
 Python 3.11+ is required. tmux is required only for pane mode. These are executable wrappers,
 so shell-only aliases/functions and their permission defaults do not apply;
-pass your desired permission flags explicitly. No bypass is added automatically.
+Team and Team Budget default to YOLO for the lead and workers in both native
+and tmux modes. Codex/TraeX receive `--dangerously-bypass-approvals-and-sandbox`;
+Claude receives `--dangerously-skip-permissions`; OpenCode receives scoped
+`allow` permissions. Worker delegation restrictions remain enforced.
+
+Use `agent-team codex --no-yolo` (also with `--tmux` / `--team-budget`) to inherit
+CLI permission settings for the whole team, or set `"yolo": false` in a preset.
+When supplying restricted permission/profile arguments, also use `--no-yolo`.
+This changes newly launched sessions; existing sessions keep their permissions.
 
 Native mode uses each tool's own delegation: Codex/TraeX agent configuration,
 Claude's team-worker subagent definition, or OpenCode's team-worker definition.
@@ -86,7 +94,7 @@ For example (replace model identifiers with ones your provider supports):
 ```
 
 Supported keys: `model`, `effort`, `worker_model`, `worker_effort`, `limit` (1 or
-2), `args` and `worker_args` (CLI argument arrays). OpenCode models require
+2), `yolo` (boolean, default true), `args` and `worker_args` (CLI argument arrays). OpenCode models require
 provider/model identifiers and reasoning effort is provider-specific. Tool names
 and delegation rules are independent of model choices. Other tools have no
 assumed budget model: configure a distinct budget combination when desired.
@@ -136,7 +144,7 @@ briefs. It verifies socket access and pane ownership. Spawn, stop and wake also
 check the control channel before performing changes. A check in an ordinary
 host shell does not establish that a sandboxed shell has the same access.
 
-For Codex with an explicit `-P` / `--permission-profile`, or explicit read-only /
+With YOLO disabled, for Codex with an explicit `-P` / `--permission-profile`, or explicit read-only /
 workspace-write `--sandbox`, the pane runner also performs a model-free
 `codex sandbox` probe before starting the interactive CLI. It preserves managed
 requirements and writes `preflight-<role>.json`. With explicit approval policy
@@ -152,7 +160,7 @@ team stops delegation with the exact error; it does not silently fall back to
 native workers or change sandbox settings. Use the coding CLI's normal approval
 mechanism when permitted, or an explicitly authorized permission profile that
 can access tmux. Profiles with approval disabled and socket access denied cannot
-run pane workers. The wrapper never adds a permission bypass. The team state
+run pane workers. When YOLO is disabled, the wrapper adds no permission bypass. The team state
 directory must also be writable by each member to exchange reports; authorize
 that directory with the CLI's normal writable-root configuration when needed.
 
