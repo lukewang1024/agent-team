@@ -117,6 +117,18 @@ class AdapterTests(unittest.TestCase):
                     elif tool == 'claude':
                         self.assertIn('--dangerously-skip-permissions', args)
 
+    def test_team_prompt_keeps_primary_waiting_for_required_agents(self):
+        args, _ = TEAM.command('codex', {'limit': 2}, 'native')
+        prompt = json.loads(next(x.split('=', 1)[1] for x in args
+                                 if x.startswith('developer_instructions=')))
+        normalized_prompt = ' '.join(prompt.split())
+        self.assertIn("must use the runtime's native agent-wait mechanism", normalized_prompt)
+        self.assertIn('do not end the turn or return an idle prompt', normalized_prompt)
+        self.assertIn(
+            'wait times out while required agents are still live, wait again',
+            normalized_prompt,
+        )
+
     def test_yolo_defaults_and_opt_out_cover_every_member(self):
         for tool in TEAM.TOOLS:
             for mode in ('native', 'tmux'):

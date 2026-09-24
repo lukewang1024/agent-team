@@ -53,6 +53,15 @@ context, rather than spawning one for every small step. The primary agent should
 continue useful independent work while delegated tasks run, using native result
 notifications or waits instead of repeatedly polling.
 
+Once useful independent work is exhausted and completion depends on live
+subagents, the primary agent must use the runtime's native agent-wait mechanism.
+Treat collecting required delegated results, integration, and final verification
+as critical-path work: do not end the turn or return an idle prompt merely because
+the remaining work is delegated. If a wait times out while required agents are
+still live, wait again unless new user input arrives or another meaningful task
+can be advanced. This intentional wait also keeps the host's native working or
+"waiting for agents" status visible to the user.
+
 Subagents promptly report blockers, conflicting assumptions, interface changes,
 and evidence that affects another task. Include the affected task, concrete
 evidence, and the decision or input needed. Use a targeted message to the relevant
