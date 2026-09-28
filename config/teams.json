@@ -3,14 +3,18 @@
     "team": {
       "model": "gpt-6-astra",
       "effort": "medium",
-      "worker_model": "gpt-6-astra",
-      "worker_effort": "low"
+      "worker_model": "gpt-6-sol",
+      "worker_effort": "high"
     },
     "budget": {
-      "model": "gpt-6-astra",
-      "effort": "medium",
-      "worker_model": "gpt-5.6-luna",
-      "worker_effort": "high"
+      "model": "gpt-6-sol",
+      "effort": "high",
+      "worker_model": "gpt-6-luna",
+      "worker_effort": "max"
+    },
+    "solo": {
+      "budget": {"model": "gpt-6-luna", "effort": "max"},
+      "expert": {"model": "gpt-6-astra", "effort": "medium"}
     }
   },
   "traex": {

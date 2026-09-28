@@ -11,9 +11,9 @@ require dotfiles, tmux-agent-workbench, a particular checkout location, or a
 specific GitHub account at runtime. Native mode does not require tmux.
 
 A terminal workbench can offer launch entries that invoke these commands.
-Personal model overrides, proxy environment, approval preferences and shell
-shortcuts belong in the user's configuration or dotfiles. The CLI does not
-infer them from shell functions. Team launches explicitly default to YOLO, as described below.
+Personal model overrides, proxy environment and approval preferences belong in
+the user's configuration or dotfiles. The CLI does not infer them from shell
+functions. Team launches explicitly default to YOLO, as described below.
 
 ## Install
 
@@ -29,6 +29,20 @@ python3 install.py
 The installer links the commands into `~/.local/bin`; ensure it is on `PATH`.
 The installer refuses to overwrite unrelated files. Keep the checkout in place.
 It does not change authentication, global CLI configuration, or global permission defaults.
+
+## Solo Codex presets
+
+`codex-budget` and `codex-expert` are installed CLI wrappers for ordinary Codex
+sessions. They set only the model and reasoning effort: GPT-6 Luna Max for
+bounded, low-cost work and GPT-6 Astra Medium for demanding work. They do not
+enable team delegation or YOLO. Plain `codex` keeps its local default model.
+
+The wrappers use the `codex.solo` presets in [teams.json](config/teams.json).
+Override either preset under `codex.solo.budget` or `codex.solo.expert` in
+`$XDG_CONFIG_HOME/agent-team/config.json`. Run
+`agent-team solo codex budget --solo-dry-run` to inspect the command without
+starting Codex. CLI wrappers cannot call a shell's `codex` function; shell
+integrations that track session history can wrap these entrypoints separately.
 
 ## Usage
 
@@ -104,8 +118,20 @@ There is no automatic budget switching.
 
 Codex additionally reads the existing `team.config.toml` / `team-budget.config.toml`
 profiles in CODEX_HOME (default `~/.codex`), when present. No personal profile
-is required. The bundled Codex presets are Astra Medium + Astra Low and Astra
-Medium + Luna High; replace them if your provider uses other model identifiers.
+is required. The bundled Codex presets are GPT-6 Astra Medium + GPT-6 Sol High
+for Team and GPT-6 Sol High + GPT-6 Luna Max for Team Budget. Team keeps a
+strong primary agent while using Sol for delegated coding work. Team Budget
+reduces the primary agent's cost and uses Luna for scoped worker tasks; Luna Max
+may take longer to finish. These choices use the [DRadar DeepSWE comparison](https://deng.codexradar.com/)
+as a starting point; measure them on your own team tasks as well. Replace these
+if your provider uses other model identifiers.
+
+The Team default uses the stronger combination because its primary agent
+coordinates and reviews delegated work. Team Budget is an explicit cost choice;
+Luna workers should receive bounded tasks. These presets do not change ordinary,
+non-team Codex sessions. For those, GPT-6 Sol High is a balanced default, with
+GPT-6 Astra Medium available when a task needs more end-to-end judgment.
+
 The JSON override, when present,
 takes precedence for team settings. Command-line options passed to the lead only
 affect the lead; use worker_args or worker_model/worker_effort for child settings.

@@ -21,15 +21,52 @@ LOADER.exec_module(TEAM)
 
 
 class AdapterTests(unittest.TestCase):
+    def test_solo_presets_keep_codex_settings_without_team_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {'XDG_CONFIG_HOME': directory,
+                                          'AGENT_TEAM_ROLE': 'lead'}):
+                for preset, model, effort in (
+                    ('budget', 'gpt-6-luna', 'max'),
+                    ('expert', 'gpt-6-astra', 'medium'),
+                ):
+                    with self.subTest(preset=preset):
+                        args, env = TEAM.solo_command(preset, ('resume', '--last'))
+                        self.assertEqual(args, ['codex', '-m', model, '-c',
+                                                'model_reasoning_effort=' + json.dumps(effort),
+                                                'resume', '--last'])
+                        self.assertNotIn('AGENT_TEAM_ROLE', env)
+                        self.assertNotIn('--profile', args)
+                        self.assertNotIn('--dangerously-bypass-approvals-and-sandbox', args)
+                        self.assertFalse(any('developer_instructions=' in arg for arg in args))
+
+    def test_solo_dry_run_preserves_codex_arguments_after_separator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {'XDG_CONFIG_HOME': directory}), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                TEAM.launch_solo(['codex', 'budget', '--approve-for-me',
+                                  '--solo-dry-run', '--', '--solo-dry-run'])
+            plan = json.loads(output.getvalue())
+            self.assertEqual(plan['mode'], 'solo')
+            self.assertEqual(plan['argv'][-3:], ['--approve-for-me', '--',
+                                                '--solo-dry-run'])
+
     def test_codex_defaults_work_without_personal_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(os.environ, {'CODEX_HOME': directory, 'XDG_CONFIG_HOME': directory}):
                 cfg = TEAM.settings('codex', False)
                 self.assertEqual(cfg['model'], 'gpt-6-astra')
-                self.assertEqual(cfg['worker_effort'], 'low')
+                self.assertEqual(cfg['worker_model'], 'gpt-6-sol')
+                self.assertEqual(cfg['worker_effort'], 'high')
                 args, _ = TEAM.command('codex', cfg, 'native')
                 self.assertNotIn('--profile', args)
                 self.assertIn('gpt-6-astra', args)
+                self.assertIn('agents.default_subagent_model="gpt-6-sol"', args)
+
+                budget = TEAM.settings('codex', True)
+                self.assertEqual(budget['model'], 'gpt-6-sol')
+                self.assertEqual(budget['effort'], 'high')
+                self.assertEqual(budget['worker_model'], 'gpt-6-luna')
+                self.assertEqual(budget['worker_effort'], 'max')
 
     def test_budget_prompt_matches_custom_resolved_settings(self):
         cfg = {'model': 'lead-model', 'worker_model': 'budget-worker',
