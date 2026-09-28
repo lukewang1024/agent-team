@@ -30,7 +30,7 @@ class AdapterTests(unittest.TestCase):
                     ('expert', 'gpt-6-astra', 'medium'),
                 ):
                     with self.subTest(preset=preset):
-                        args, env = TEAM.solo_command(preset, ('resume', '--last'))
+                        args, env = TEAM.solo_command('codex', preset, ('resume', '--last'))
                         self.assertEqual(args, ['codex', '-m', model, '-c',
                                                 'model_reasoning_effort=' + json.dumps(effort),
                                                 'resume', '--last'])
@@ -38,6 +38,18 @@ class AdapterTests(unittest.TestCase):
                         self.assertNotIn('--profile', args)
                         self.assertNotIn('--dangerously-bypass-approvals-and-sandbox', args)
                         self.assertFalse(any('developer_instructions=' in arg for arg in args))
+
+    def test_traex_budget_is_a_solo_wrapper_with_existing_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {'XDG_CONFIG_HOME': directory,
+                                          'AGENT_TEAM_ROLE': 'lead'}):
+                args, env = TEAM.solo_command('traex', 'budget', ('resume', 'session-id'))
+        self.assertEqual(args, ['traex', '--dangerously-bypass-approvals-and-sandbox',
+                                '-m', 'GPT-5.6-Luna', '-c',
+                                'model_reasoning_effort=' + json.dumps('high'),
+                                'resume', 'session-id'])
+        self.assertNotIn('AGENT_TEAM_ROLE', env)
+        self.assertFalse(any('developer_instructions=' in arg for arg in args))
 
     def test_solo_dry_run_preserves_codex_arguments_after_separator(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -21,7 +21,8 @@ class InstallTests(unittest.TestCase):
             self.assertEqual((target / 'agent-team').resolve(), ROOT / 'bin/agent-team')
             self.assertEqual((target / 'codex-budget').resolve(), ROOT / 'bin/codex-budget')
             self.assertEqual((target / 'codex-expert').resolve(), ROOT / 'bin/codex-expert')
-            self.assertEqual(len(list(target.iterdir())), 11)
+            self.assertEqual((target / 'traex-budget').resolve(), ROOT / 'bin/traex-budget')
+            self.assertEqual(len(list(target.iterdir())), 12)
 
     def test_unrelated_entrypoint_is_preserved_before_any_install(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -84,31 +84,37 @@ def settings(tool, budget):
     return value
 
 
-def solo_settings(preset):
-    if preset not in ("budget", "expert"):
-        fail("Solo preset must be budget or expert")
-    value = read(CONFIG / "teams.json")["codex"]["solo"][preset].copy()
+def solo_settings(tool, preset):
+    config = read(CONFIG / "teams.json")
+    if tool not in ("codex", "traex") or preset not in config[tool].get("solo", {}):
+        fail("Unsupported solo tool or preset")
+    value = config[tool]["solo"][preset].copy()
     override = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-team/config.json"
     if override.exists():
-        merge(value, read(override).get("codex", {}).get("solo", {}).get(preset, {}))
+        merge(value, read(override).get(tool, {}).get("solo", {}).get(preset, {}))
     for key in ("model", "effort"):
         if not isinstance(value.get(key), str) or not value[key]:
             fail(f"Solo {key} must be a nonempty string")
+    if not isinstance(value.get("yolo", False), bool):
+        fail("Solo yolo must be a boolean")
     return value
 
 
-def solo_command(preset, extra=()):
-    cfg = solo_settings(preset)
-    args = ["codex", "-m", cfg["model"], "-c", "model_reasoning_effort=" + json.dumps(cfg["effort"])]
+def solo_command(tool, preset, extra=()):
+    cfg = solo_settings(tool, preset)
+    args = [tool]
+    if cfg.get("yolo", False):
+        args.append("--dangerously-bypass-approvals-and-sandbox")
+    args += ["-m", cfg["model"], "-c", "model_reasoning_effort=" + json.dumps(cfg["effort"])]
     args.extend(extra)
     env = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_TEAM_")}
     return args, env
 
 
 def launch_solo(argv):
-    if len(argv) < 2 or argv[0] != "codex":
-        fail("Usage: agent-team solo codex <budget|expert> [Codex args]")
-    preset = argv[1]
+    if len(argv) < 2:
+        fail("Usage: agent-team solo <codex|traex> <preset> [CLI args]")
+    tool, preset = argv[:2]
     dry = False
     literal = False
     extra = []
@@ -119,14 +125,14 @@ def launch_solo(argv):
             dry = True
         else:
             extra.append(arg)
-    args, env = solo_command(preset, extra)
+    args, env = solo_command(tool, preset, extra)
     if dry:
-        print(json.dumps({"tool": "codex", "mode": "solo", "preset": preset,
-                          "config": solo_settings(preset), "argv": args}, ensure_ascii=False, indent=2))
+        print(json.dumps({"tool": tool, "mode": "solo", "preset": preset,
+                          "config": solo_settings(tool, preset), "argv": args}, ensure_ascii=False, indent=2))
         return
-    if not shutil.which("codex"):
-        fail("CLI is not installed: codex")
-    return os.execvpe("codex", args, env)
+    if not shutil.which(tool):
+        fail(f"CLI is not installed: {tool}")
+    return os.execvpe(tool, args, env)
 
 
 def instructions(mode, worker=False, cfg=None, budget=False):
@@ -692,6 +698,7 @@ def main():
         print("Usage: agent-team [--tmux]  # choose a coding agent interactively\n"
               "       agent-team <codex|traex|opencode|claude> [--team-budget] [--tmux] [CLI args]\n"
               "       agent-team solo codex <budget|expert> [Codex args]\n"
+              "       agent-team solo traex budget [TraeX args]\n"
               "       agent-team <spawn|send|report|receive|wait|status|stop|doctor> --help\n"
               "Team default: YOLO and native subagents. --no-yolo inherits CLI permissions. --tmux: interactive pane workers only.\n"
               "--team-dry-run and --solo-dry-run print launch plans without starting an agent.\n"

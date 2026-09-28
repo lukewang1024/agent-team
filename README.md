@@ -30,7 +30,7 @@ The installer links the commands into `~/.local/bin`; ensure it is on `PATH`.
 The installer refuses to overwrite unrelated files. Keep the checkout in place.
 It does not change authentication, global CLI configuration, or global permission defaults.
 
-## Solo Codex presets
+## Solo presets
 
 `codex-budget` and `codex-expert` are installed CLI wrappers for ordinary Codex
 sessions. They set only the model and reasoning effort: GPT-6 Luna Max for
@@ -43,6 +43,12 @@ Override either preset under `codex.solo.budget` or `codex.solo.expert` in
 `agent-team solo codex budget --solo-dry-run` to inspect the command without
 starting Codex. CLI wrappers cannot call a shell's `codex` function; shell
 integrations that track session history can wrap these entrypoints separately.
+
+`traex-budget` is the same kind of CLI wrapper for ordinary TraeX sessions. It
+uses `traex.solo.budget` in [teams.json](config/teams.json) and preserves the
+existing GPT-5.6 Luna High and YOLO settings. Override that preset in
+`$XDG_CONFIG_HOME/agent-team/config.json`, or inspect its launch command with
+`agent-team solo traex budget --solo-dry-run`.
 
 ## Usage
 
