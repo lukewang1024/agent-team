@@ -45,30 +45,39 @@ def merge(base, extra):
     return base
 
 
-def settings(tool, budget):
+def settings(tool, budget, expert=False):
     config = read(CONFIG / "teams.json")
-    value = config[tool]["budget" if budget else "team"].copy()
-    # Existing personal Codex profiles remain optional compatibility overrides.
+    if expert and tool != "codex":
+        fail("Expert preset is only available for Codex")
+    preset = "expert" if expert else "budget" if budget else "team"
+    value = config[tool][preset].copy()
+    if config[tool].get("env"):
+        value["env"] = dict(config[tool]["env"])
+    # Bundled team settings take precedence over optional older Codex profiles.
     if tool == "codex":
         import tomllib
-        profile = "team-budget" if budget else "team"
+        profile = "team-expert" if expert else "team-budget" if budget else "team"
         home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
         path = home / (profile + ".config.toml")
         if path.exists():
             native = tomllib.loads(path.read_text())
             mapping = {"model": "model", "model_reasoning_effort": "effort"}
             for source, target in mapping.items():
-                if source in native:
+                if source in native and target not in value:
                     value[target] = native[source]
             agents = native.get("agents", {})
             for source, target in [("default_subagent_model", "worker_model"),
                                    ("default_subagent_reasoning_effort", "worker_effort"),
                                    ("max_concurrent_threads_per_session", "limit")]:
-                if source in agents:
+                if source in agents and target not in value:
                     value[target] = agents[source]
     override = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-team/config.json"
     if override.exists():
-        merge(value, read(override).get(tool, {}).get("budget" if budget else "team", {}))
+        personal = read(override).get(tool, {})
+        if personal.get("env"):
+            value.setdefault("env", {})
+            merge(value["env"], personal["env"])
+        merge(value, personal.get(preset, {}))
     value.setdefault("yolo", True)
     if not isinstance(value["yolo"], bool):
         fail("yolo must be a boolean")
@@ -81,7 +90,18 @@ def settings(tool, budget):
     for key in ("args", "worker_args"):
         if key in value and (not isinstance(value[key], list) or not all(isinstance(v, str) for v in value[key])):
             fail(f"{key} must be an array of CLI argument strings")
+    if "env" in value and (not isinstance(value["env"], dict)
+                           or not all(isinstance(k, str) and isinstance(v, str)
+                                      for k, v in value["env"].items())):
+        fail("env must be a mapping of string names to string values")
     return value
+
+
+def environment(cfg):
+    env = os.environ.copy()
+    for key, value in cfg.get("env", {}).items():
+        env.setdefault(key, value)
+    return env
 
 
 def solo_settings(tool, preset):
@@ -103,6 +123,8 @@ def solo_settings(tool, preset):
 def solo_command(tool, preset, extra=()):
     cfg = solo_settings(tool, preset)
     args = [tool]
+    if tool == "codex":
+        args.append("--no-daemon")
     if cfg.get("yolo", False):
         args.append("--dangerously-bypass-approvals-and-sandbox")
     args += ["-m", cfg["model"], "-c", "model_reasoning_effort=" + json.dumps(cfg["effort"])]
@@ -135,9 +157,9 @@ def launch_solo(argv):
     return os.execvpe(tool, args, env)
 
 
-def instructions(mode, worker=False, cfg=None, budget=False):
+def instructions(mode, worker=False, cfg=None, budget=False, expert=False):
     cfg = cfg or {}
-    selected = {"preset": "team-budget" if budget else "team", "mode": mode,
+    selected = {"preset": "team-expert" if expert else "team-budget" if budget else "team", "mode": mode,
                 **{key: cfg.get(key) for key in ("model", "effort", "worker_model", "worker_effort")}}
     common = ("Resolved configuration for THIS invocation (authoritative; do not infer it "
               "from other profiles or repository examples):\n" + json.dumps(selected) + "\n"
@@ -158,13 +180,13 @@ def instructions(mode, worker=False, cfg=None, budget=False):
     return marker
 
 
-def command(tool, cfg, mode, worker=False, extra=(), brief=None, budget=False):
-    env = os.environ.copy()
+def command(tool, cfg, mode, worker=False, extra=(), brief=None, budget=False, expert=False):
+    env = environment(cfg)
     if mode == "native":
         for key in tuple(env):
             if key.startswith("AGENT_TEAM_"):
                 env.pop(key)
-    prompt = instructions(mode, worker, cfg, budget)
+    prompt = instructions(mode, worker, cfg, budget, expert)
     if mode == "tmux" and os.environ.get("AGENT_TEAM_DIR"):
         prefix = shlex.join(["env", "AGENT_TEAM_DIR=" + os.environ["AGENT_TEAM_DIR"],
                              "AGENT_TEAM_ROLE=" + os.environ.get("AGENT_TEAM_ROLE", "lead"), "agent-team"])
@@ -173,6 +195,8 @@ def command(tool, cfg, mode, worker=False, extra=(), brief=None, budget=False):
     effort = cfg.get("worker_effort", cfg.get("effort")) if worker else cfg.get("effort")
     disabled = mode == "tmux" or worker
     args = [tool]
+    if tool == "codex":
+        args.append("--no-daemon")
     yolo = cfg.get("yolo", True)
     if yolo and tool in ("codex", "traex"):
         args.append("--dangerously-bypass-approvals-and-sandbox")
@@ -180,7 +204,7 @@ def command(tool, cfg, mode, worker=False, extra=(), brief=None, budget=False):
         args.append("--dangerously-skip-permissions")
     if tool in ("codex", "traex"):
         if tool == "codex" and not worker:
-            profile = "team-budget" if budget else "team"
+            profile = "team-expert" if expert else "team-budget" if budget else "team"
             home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
             if (home / (profile + ".config.toml")).exists():
                 args += ["--profile", profile]
@@ -267,6 +291,74 @@ def command(tool, cfg, mode, worker=False, extra=(), brief=None, budget=False):
         else:
             args += ["--", brief]
     return args, env
+
+
+def direct_command(tool, cfg, extra=(), budget=False):
+    """Build a direct CLI invocation from the team/budget preset resolver."""
+    args = [tool]
+    if cfg.get("yolo", True):
+        if tool in ("codex", "traex"):
+            args.append("--yolo")
+        elif tool == "claude":
+            args.append("--dangerously-skip-permissions")
+        elif tool == "opencode":
+            args.append("--auto")
+    if tool in ("codex", "traex"):
+        model = cfg.get("worker_model") if budget and cfg.get("worker_model") else cfg.get("model")
+        effort = cfg.get("worker_effort") if budget and cfg.get("worker_effort") else cfg.get("effort")
+        if model:
+            args += ["-m", model]
+        if effort:
+            args += ["-c", "model_reasoning_effort=" + json.dumps(effort)]
+    elif tool == "claude":
+        model = cfg.get("worker_model") if budget and cfg.get("worker_model") else cfg.get("model")
+        effort = cfg.get("worker_effort") if budget and cfg.get("worker_effort") else cfg.get("effort")
+        if model:
+            args += ["--model", model]
+        if effort:
+            args += ["--effort", effort]
+    elif tool == "opencode":
+        model = cfg.get("worker_model") if budget and cfg.get("worker_model") else cfg.get("model")
+        if model:
+            args += ["--model", model]
+    args += list(extra)
+    if tool == "codex" and "--no-daemon" not in args:
+        for arg in args[1:]:
+            if arg == "--":
+                break
+            if (arg in ("-c", "--config", "--enable", "--disable", "--search")
+                    or arg.startswith(("--config=", "--enable=", "--disable="))):
+                args.insert(1, "--no-daemon")
+                break
+    return args
+
+
+def run_direct(tool, argv):
+    budget = False
+    no_yolo = False
+    forwarded = []
+    literal = False
+    for arg in argv:
+        if arg == "--":
+            literal = True
+            forwarded.append(arg)
+            continue
+        if literal:
+            forwarded.append(arg)
+            continue
+        if arg == "--budget":
+            budget = True
+        elif arg == "--no-yolo":
+            no_yolo = True
+        else:
+            forwarded.append(arg)
+    cfg = settings(tool, budget)
+    if no_yolo:
+        cfg["yolo"] = False
+    args = direct_command(tool, cfg, forwarded, budget=budget)
+    if not shutil.which(tool):
+        fail(f"CLI is not installed: {tool}")
+    return os.execvpe(args[0], args, environment(cfg))
 
 
 def tmux_argv(*args):
@@ -356,6 +448,7 @@ def probe(state, role):
 
 def launch(tool, argv):
     budget = False
+    expert = False
     pane_mode = False
     dry = False
     no_yolo = False
@@ -371,6 +464,8 @@ def launch(tool, argv):
             continue
         if arg == "--team-budget":
             budget = True
+        elif arg == "--team-expert":
+            expert = True
         elif arg == "--tmux":
             pane_mode = True
         elif arg == "--no-yolo":
@@ -379,7 +474,9 @@ def launch(tool, argv):
             dry = True
         else:
             forwarded.append(arg)
-    cfg = settings(tool, budget)
+    if budget and expert:
+        fail("Choose only one team preset")
+    cfg = settings(tool, budget, expert)
     if no_yolo:
         cfg["yolo"] = False
     mode = "tmux" if pane_mode else "native"
@@ -397,7 +494,7 @@ def launch(tool, argv):
         if worker_args != cfg.get("worker_args", []) and worker_cwd != cwd:
             fail("worker_args must not select a different working directory")
         cfg["worker_args"] = worker_args
-    args, env = command(tool, cfg, mode, extra=forwarded, budget=budget)
+    args, env = command(tool, cfg, mode, extra=forwarded, budget=budget, expert=expert)
     if dry:
         print(json.dumps({"tool": tool, "mode": mode, "config": cfg, "cwd": cwd, "argv": args}, ensure_ascii=False, indent=2))
         return
@@ -411,7 +508,7 @@ def launch(tool, argv):
     base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "agent-team"
     directory = base / ident
     directory.mkdir(parents=True, mode=0o700)
-    state = {"id": ident, "tool": tool, "config": cfg, "budget": budget,
+    state = {"id": ident, "tool": tool, "config": cfg, "budget": budget, "expert": expert,
              "cwd": cwd, "extra": forwarded, "members": {}, "messages": [], "next_message": 1}
     write(directory / "state.json", state)
     shell_command = runner(directory, "lead")
@@ -540,7 +637,8 @@ def run_pane(directory, name):
     worker = name != "lead"
     brief = state["members"][name].get("brief") if worker else None
     args, env = command(state["tool"], state["config"], "tmux", worker,
-                        extra=() if worker else state["extra"], brief=brief, budget=state["budget"])
+                        extra=() if worker else state["extra"], brief=brief,
+                        budget=state["budget"], expert=state.get("expert", False))
     try:
         if state["tool"] == "codex":
             codex_preflight(args, env, state["cwd"])
@@ -688,17 +786,23 @@ def main():
         choice = input("Coding agent [1]: ").strip() or "1"
         if not choice.isdigit() or not 1 <= int(choice) <= len(available):
             fail("Invalid agent selection")
-        preset = input("Preset: 1. team  2. budget [1]: ").strip() or "1"
-        if preset not in ("1", "2"):
+        tool = available[int(choice) - 1]
+        prompt = ("Preset: 1. team  2. budget  3. expert [1]: " if tool == "codex"
+                  else "Preset: 1. team  2. budget [1]: ")
+        preset = input(prompt).strip() or "1"
+        if preset not in (("1", "2", "3") if tool == "codex" else ("1", "2")):
             fail("Invalid preset selection")
-        return launch(available[int(choice) - 1], argv + (["--team-budget"] if preset == "2" else []))
+        flag = {"1": [], "2": ["--team-budget"], "3": ["--team-expert"]}[preset]
+        return launch(tool, argv + flag)
     if argv[0] in TOOLS:
         return launch(argv[0], argv[1:])
     if argv[0] in ("-h", "--help"):
         print("Usage: agent-team [--tmux]  # choose a coding agent interactively\n"
               "       agent-team <codex|traex|opencode|claude> [--team-budget] [--tmux] [CLI args]\n"
+              "       agent-team codex [--team-expert] [--tmux] [CLI args]\n"
               "       agent-team solo codex <budget|expert> [Codex args]\n"
               "       agent-team solo traex budget [TraeX args]\n"
+              "       agent-team run <codex|traex|opencode|claude> [--budget] [--no-yolo] [CLI args]\n"
               "       agent-team <spawn|send|report|receive|wait|status|stop|doctor> --help\n"
               "Team default: YOLO and native subagents. --no-yolo inherits CLI permissions. --tmux: interactive pane workers only.\n"
               "--team-dry-run and --solo-dry-run print launch plans without starting an agent.\n"
@@ -708,6 +812,10 @@ def main():
         if sys.argv[2] not in TOOLS:
             fail("Unsupported CLI")
         return launch(sys.argv[2], sys.argv[3:])
+    if len(sys.argv) > 2 and sys.argv[1] == "run":
+        if sys.argv[2] not in TOOLS:
+            fail("Unsupported CLI")
+        return run_direct(sys.argv[2], sys.argv[3:])
     if len(sys.argv) == 4 and sys.argv[1] == "run-pane":
         return run_pane(sys.argv[2], sys.argv[3])
     return control(sys.argv[1:])

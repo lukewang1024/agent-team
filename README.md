@@ -36,6 +36,8 @@ It does not change authentication, global CLI configuration, or global permissio
 sessions. They set only the model and reasoning effort: GPT-6 Luna Max for
 bounded, low-cost work and GPT-6 Astra Medium for demanding work. They do not
 enable team delegation or YOLO. Plain `codex` keeps its local default model.
+These wrappers explicitly use embedded mode because their one-run settings
+require `-c`.
 
 The wrappers use the `codex.solo` presets in [teams.json](config/teams.json).
 Override either preset under `codex.solo.budget` or `codex.solo.expert` in
@@ -54,7 +56,8 @@ existing GPT-5.6 Luna High and YOLO settings. Override that preset in
 
 
 `agent-team` opens a CLI picker for Codex, TraeX, OpenCode, or Claude, followed
-by a team / budget preset picker. The default uses native subagents. Add
+by a preset picker. Codex offers expert, team, and budget; the other tools offer
+team and budget. The default uses native subagents. Add
 `--tmux` to select interactive pane workers instead, for the whole session.
 
 ```sh
@@ -64,11 +67,22 @@ agent-team codex                   # select directly
 agent-team claude --tmux
 agent-team opencode --team-budget --tmux
 codex-team                         # shortcut for agent-team codex
+codex-team-expert                  # Astra Medium lead + Sol High workers
 codex-team-budget --tmux           # budget shortcut
 ```
 
 Equivalent `traex-team`, `opencode-team`, and `claude-team` shortcuts and their
-`-budget` forms are installed by `python3 install.py`. All launch the same controller.
+`-budget` forms and `codex-team-expert` are installed by `python3 install.py`.
+All launch the same controller.
+
+`codex-yolo`, `traex-yolo`, `claude-yolo`, and `opencode-yolo` only enable each
+CLI's permissive execution mode and forward the remaining arguments. They use
+the CLI's normal model settings and do not start a team.
+
+`agent-team run <tool>` starts one CLI with the selected team preset's model;
+`--budget` uses its worker model and effort when configured. This path defaults
+to YOLO and supports `--no-yolo`. It does not enable delegation. The separate
+`agent-team solo` presets above keep their own model and permission settings.
 Python 3.11+ is required. tmux is required only for pane mode. These are executable wrappers,
 so shell-only aliases/functions and their permission defaults do not apply;
 Team and Team Budget default to YOLO for the lead and workers in both native
@@ -115,28 +129,28 @@ For example (replace model identifiers with ones your provider supports):
 }
 ```
 
-Supported keys: `model`, `effort`, `worker_model`, `worker_effort`, `limit` (1 or
-2), `yolo` (boolean, default true), `args` and `worker_args` (CLI argument arrays). OpenCode models require
+Supported team keys: `model`, `effort`, `worker_model`, `worker_effort`, `limit` (1 or
+2), `yolo` (boolean, default true), `args`, `worker_args` (CLI argument arrays),
+and agent-level `env` defaults. Environment defaults apply only when the
+variable is not already present externally. OpenCode models require
 provider/model identifiers and reasoning effort is provider-specific. Tool names
 and delegation rules are independent of model choices. Other tools have no
 assumed budget model: configure a distinct budget combination when desired.
 There is no automatic budget switching.
 
-Codex additionally reads the existing `team.config.toml` / `team-budget.config.toml`
+Codex additionally reads the existing `team.config.toml`, `team-budget.config.toml`,
+or `team-expert.config.toml`
 profiles in CODEX_HOME (default `~/.codex`), when present. No personal profile
-is required. The bundled Codex presets are GPT-6 Astra Medium + GPT-6 Sol High
-for Team and GPT-6 Sol High + GPT-6 Luna Max for Team Budget. Team keeps a
-strong primary agent while using Sol for delegated coding work. Team Budget
-reduces the primary agent's cost and uses Luna for scoped worker tasks; Luna Max
-may take longer to finish. These choices use the [DRadar DeepSWE comparison](https://deng.codexradar.com/)
-as a starting point; measure them on your own team tasks as well. Replace these
-if your provider uses other model identifiers.
+is required. The bundled Codex team presets are:
 
-The Team default uses the stronger combination because its primary agent
-coordinates and reviews delegated work. Team Budget is an explicit cost choice;
-Luna workers should receive bounded tasks. These presets do not change ordinary,
-non-team Codex sessions. For those, GPT-6 Sol High is a balanced default, with
-GPT-6 Astra Medium available when a task needs more end-to-end judgment.
+| Command | Lead | Workers |
+| --- | --- | --- |
+| `codex-team-expert` | GPT-6 Astra, medium | GPT-6 Sol, high |
+| `codex-team` | GPT-6 Sol, high | GPT-6 Sol, low |
+| `codex-team-budget` | GPT-6 Sol, high | GPT-6 Luna, max |
+
+The equivalent direct launch option is `agent-team codex --team-expert`.
+Solo presets above remain separate from team presets.
 
 The JSON override, when present,
 takes precedence for team settings. Command-line options passed to the lead only

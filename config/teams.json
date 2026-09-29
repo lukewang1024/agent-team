@@ -1,10 +1,16 @@
 {
   "codex": {
-    "team": {
+    "expert": {
       "model": "gpt-6-astra",
       "effort": "medium",
       "worker_model": "gpt-6-sol",
       "worker_effort": "high"
+    },
+    "team": {
+      "model": "gpt-6-sol",
+      "effort": "high",
+      "worker_model": "gpt-6-sol",
+      "worker_effort": "low"
     },
     "budget": {
       "model": "gpt-6-sol",
@@ -29,6 +35,9 @@
     "budget": {}
   },
   "claude": {
+    "env": {
+      "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1"
+    },
     "team": {},
     "budget": {}
   }

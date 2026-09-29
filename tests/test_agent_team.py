@@ -31,7 +31,7 @@ class AdapterTests(unittest.TestCase):
                 ):
                     with self.subTest(preset=preset):
                         args, env = TEAM.solo_command('codex', preset, ('resume', '--last'))
-                        self.assertEqual(args, ['codex', '-m', model, '-c',
+                        self.assertEqual(args, ['codex', '--no-daemon', '-m', model, '-c',
                                                 'model_reasoning_effort=' + json.dumps(effort),
                                                 'resume', '--last'])
                         self.assertNotIn('AGENT_TEAM_ROLE', env)
@@ -51,6 +51,27 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn('AGENT_TEAM_ROLE', env)
         self.assertFalse(any('developer_instructions=' in arg for arg in args))
 
+    def test_direct_command_uses_team_budget_with_explicit_embedded_mode(self):
+        args = TEAM.direct_command('codex', {
+            'model': 'lead-model', 'effort': 'medium',
+            'worker_model': 'budget-model', 'worker_effort': 'high', 'yolo': True,
+        }, ['--help'], budget=True)
+        self.assertEqual(args, [
+            'codex', '--no-daemon', '--yolo', '-m', 'budget-model',
+            '-c', 'model_reasoning_effort="high"', '--help',
+        ])
+
+    def test_direct_run_supports_budget_and_preserves_literal_arguments(self):
+        cfg = {'model': 'budget-model', 'effort': 'high', 'yolo': True}
+        with patch.object(TEAM, 'settings', return_value=cfg), \
+                patch.object(TEAM.shutil, 'which', return_value='/bin/codex'), \
+                patch.object(TEAM.os, 'execvpe') as execute:
+            TEAM.run_direct('codex', ['--budget', '--', '--help'])
+        self.assertEqual(execute.call_args.args[1], [
+            'codex', '--no-daemon', '--yolo', '-m', 'budget-model',
+            '-c', 'model_reasoning_effort="high"', '--', '--help',
+        ])
+
     def test_solo_dry_run_preserves_codex_arguments_after_separator(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(os.environ, {'XDG_CONFIG_HOME': directory}), \
@@ -65,20 +86,39 @@ class AdapterTests(unittest.TestCase):
     def test_codex_defaults_work_without_personal_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict(os.environ, {'CODEX_HOME': directory, 'XDG_CONFIG_HOME': directory}):
-                cfg = TEAM.settings('codex', False)
-                self.assertEqual(cfg['model'], 'gpt-6-astra')
-                self.assertEqual(cfg['worker_model'], 'gpt-6-sol')
-                self.assertEqual(cfg['worker_effort'], 'high')
-                args, _ = TEAM.command('codex', cfg, 'native')
-                self.assertNotIn('--profile', args)
-                self.assertIn('gpt-6-astra', args)
-                self.assertIn('agents.default_subagent_model="gpt-6-sol"', args)
+                combinations = (
+                    (False, True, 'gpt-6-astra', 'medium', 'gpt-6-sol', 'high'),
+                    (False, False, 'gpt-6-sol', 'high', 'gpt-6-sol', 'low'),
+                    (True, False, 'gpt-6-sol', 'high', 'gpt-6-luna', 'max'),
+                )
+                for budget, expert, model, effort, worker_model, worker_effort in combinations:
+                    with self.subTest(budget=budget, expert=expert):
+                        cfg = TEAM.settings('codex', budget, expert)
+                        self.assertEqual((cfg['model'], cfg['effort'], cfg['worker_model'],
+                                          cfg['worker_effort']),
+                                         (model, effort, worker_model, worker_effort))
+                        args, _ = TEAM.command('codex', cfg, 'native', budget=budget, expert=expert)
+                        self.assertNotIn('--profile', args)
+                        self.assertIn('--no-daemon', args)
+                        self.assertIn(model, args)
+                        self.assertIn('model_reasoning_effort="' + effort + '"', args)
+                        self.assertIn('agents.default_subagent_model="' + worker_model + '"', args)
+                        self.assertIn('agents.default_subagent_reasoning_effort="' + worker_effort + '"', args)
 
-                budget = TEAM.settings('codex', True)
-                self.assertEqual(budget['model'], 'gpt-6-sol')
-                self.assertEqual(budget['effort'], 'high')
-                self.assertEqual(budget['worker_model'], 'gpt-6-luna')
-                self.assertEqual(budget['worker_effort'], 'max')
+    def test_expert_profile_cannot_override_preset_but_json_can(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / 'team-expert.config.toml').write_text(
+                'model = "stale-model"\n[agents]\ndefault_subagent_model = "stale-worker"\n')
+            folder = Path(directory) / 'agent-team'
+            folder.mkdir()
+            (folder / 'config.json').write_text('{"codex":{"expert":{"worker_effort":"max"}}}')
+            with patch.dict(os.environ, {'CODEX_HOME': directory, 'XDG_CONFIG_HOME': directory}):
+                cfg = TEAM.settings('codex', False, True)
+                args, _ = TEAM.command('codex', cfg, 'native', expert=True)
+            self.assertEqual(cfg['model'], 'gpt-6-astra')
+            self.assertEqual(cfg['worker_model'], 'gpt-6-sol')
+            self.assertEqual(cfg['worker_effort'], 'max')
+            self.assertIn('team-expert', args)
 
     def test_budget_prompt_matches_custom_resolved_settings(self):
         cfg = {'model': 'lead-model', 'worker_model': 'budget-worker',
@@ -144,6 +184,29 @@ class AdapterTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             TEAM.main()
         launch.assert_called_once_with('claude', ['--tmux', '--team-budget'])
+
+    def test_picker_selects_codex_expert(self):
+        with patch.object(TEAM.sys, 'argv', ['agent-team']), \
+                patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \
+                patch.object(TEAM.shutil, 'which', side_effect=lambda tool: '/bin/codex' if tool == 'codex' else None), \
+                patch('builtins.input', side_effect=['1', '3']), \
+                patch.object(TEAM, 'launch') as launch, \
+                contextlib.redirect_stdout(io.StringIO()):
+            TEAM.main()
+        launch.assert_called_once_with('codex', ['--team-expert'])
+
+    def test_expert_dry_run_and_preset_conflict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {'CODEX_HOME': directory, 'XDG_CONFIG_HOME': directory}), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                TEAM.launch('codex', ['--team-expert', '--team-dry-run'])
+            result = json.loads(output.getvalue())
+        self.assertEqual(result['config']['worker_model'], 'gpt-6-sol')
+        self.assertIn('model_reasoning_effort="medium"', result['argv'])
+        with self.assertRaisesRegex(RuntimeError, 'only one team preset'):
+            TEAM.launch('codex', ['--team-expert', '--team-budget', '--team-dry-run'])
+        with self.assertRaisesRegex(RuntimeError, 'only available for Codex'):
+            TEAM.launch('claude', ['--team-expert', '--team-dry-run'])
 
     def test_native_and_pane_modes_use_distinct_delegation(self):
         for tool in TEAM.TOOLS:
@@ -233,6 +296,13 @@ class AdapterTests(unittest.TestCase):
                 self.assertEqual(cfg['worker_model'], 'custom')
                 self.assertEqual(cfg['limit'], 1)
                 self.assertNotIn('worker_model', TEAM.settings('claude', False))
+
+    def test_claude_environment_default_respects_external_value(self):
+        cfg = TEAM.settings('claude', False)
+        self.assertEqual(cfg['env']['CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR'], '1')
+        with patch.dict(os.environ, {'CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR': '0'}):
+            _, env = TEAM.command('claude', cfg, 'native')
+        self.assertEqual(env['CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR'], '0')
 
     def test_prompt_after_separator_is_not_a_wrapper_flag(self):
         with patch.object(TEAM, 'settings', return_value={'limit': 2}), patch.object(TEAM.os, 'execvpe') as execute:
