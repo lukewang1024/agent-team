@@ -1,33 +1,77 @@
 {
   "codex": {
-    "expert": {
-      "model": "gpt-6-astra",
-      "effort": "medium",
-      "worker_model": "gpt-6-sol",
-      "worker_effort": "high"
+    "scenes": {
+      "daily": {
+        "model": "gpt-6.1-sol",
+        "effort": "max",
+        "fast": true,
+        "worker_model": "gpt-6.1-sol",
+        "worker_effort": "max"
+      },
+      "hard": {
+        "model": "gpt-6-astra",
+        "effort": "xhigh",
+        "fast": false,
+        "worker_model": "gpt-6.1-sol",
+        "worker_effort": "max"
+      },
+      "batch": {
+        "model": "gpt-6-luna",
+        "effort": "max",
+        "fast": false,
+        "lead_model": "gpt-6.1-sol",
+        "lead_effort": "high",
+        "worker_model": "gpt-6-luna",
+        "worker_effort": "max"
+      }
     },
-    "team": {
-      "model": "gpt-6-sol",
-      "effort": "high",
-      "worker_model": "gpt-6-sol",
-      "worker_effort": "low"
-    },
-    "budget": {
-      "model": "gpt-6-sol",
-      "effort": "high",
-      "worker_model": "gpt-6-luna",
-      "worker_effort": "max"
-    },
-    "solo": {
-      "budget": {"model": "gpt-6-luna", "effort": "max"},
-      "expert": {"model": "gpt-6-astra", "effort": "medium"}
+    "adjustments": {
+      "quick": {
+        "model": "gpt-6-astra",
+        "effort": "low"
+      }
     }
   },
   "traex": {
     "team": {},
     "budget": {},
     "solo": {
-      "budget": {"model": "GPT-5.6-Luna", "effort": "high", "yolo": true}
+      "budget": {
+        "model": "GPT-5.6-Luna",
+        "effort": "xhigh",
+        "yolo": true
+      }
+    },
+    "scenes": {
+      "daily": {
+        "model": "gpt-6.1-sol",
+        "effort": "xhigh",
+        "worker_model": "gpt-6.1-sol",
+        "worker_effort": "xhigh",
+        "fast": false
+      },
+      "hard": {
+        "model": "gpt-6-astra",
+        "effort": "xhigh",
+        "worker_model": "gpt-6.1-sol",
+        "worker_effort": "xhigh",
+        "fast": false
+      },
+      "batch": {
+        "model": "gpt-5.6-luna",
+        "effort": "xhigh",
+        "lead_model": "gpt-6.1-sol",
+        "lead_effort": "xhigh",
+        "worker_model": "gpt-5.6-luna",
+        "worker_effort": "xhigh",
+        "fast": false
+      }
+    },
+    "adjustments": {
+      "quick": {
+        "model": "gpt-6-astra",
+        "effort": "low"
+      }
     }
   },
   "opencode": {

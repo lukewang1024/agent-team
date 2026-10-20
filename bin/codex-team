@@ -1,2 +1,2 @@
 #!/bin/sh
-exec agent-team launch codex "$@"
+exec agent-team start codex --team "$@"

@@ -1,2 +1,2 @@
 #!/bin/sh
-exec agent-team launch traex --team-budget "$@"
+exec agent-team start traex --scene batch --team "$@"

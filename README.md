@@ -30,70 +30,73 @@ The installer links the commands into `~/.local/bin`; ensure it is on `PATH`.
 The installer refuses to overwrite unrelated files. Keep the checkout in place.
 It does not change authentication, global CLI configuration, or global permission defaults.
 
-## Solo presets
+## Trae scenes
 
-`codex-budget` and `codex-expert` are installed CLI wrappers for ordinary Codex
-sessions. They set only the model and reasoning effort: GPT-6 Luna Max for
-bounded, low-cost work and GPT-6 Astra Medium for demanding work. They do not
-enable team delegation or YOLO. Plain `codex` keeps its local default model.
-These wrappers explicitly use embedded mode because their one-run settings
-require `-c`.
+Trae uses the same `daily`, `hard`, and `batch` scene interface. All roles use
+`xhigh`, the highest reasoning level advertised by its current model catalog.
 
-The wrappers use the `codex.solo` presets in [teams.json](config/teams.json).
-Override either preset under `codex.solo.budget` or `codex.solo.expert` in
-`$XDG_CONFIG_HOME/agent-team/config.json`. Run
-`agent-team solo codex budget --solo-dry-run` to inspect the command without
-starting Codex. CLI wrappers cannot call a shell's `codex` function; shell
-integrations that track session history can wrap these entrypoints separately.
-
-`traex-budget` is the same kind of CLI wrapper for ordinary TraeX sessions. It
-uses `traex.solo.budget` in [teams.json](config/teams.json) and preserves the
-existing GPT-5.6 Luna High and YOLO settings. Override that preset in
-`$XDG_CONFIG_HOME/agent-team/config.json`, or inspect its launch command with
-`agent-team solo traex budget --solo-dry-run`.
-
-## Usage
-
-
-`agent-team` opens a CLI picker for Codex, TraeX, OpenCode, or Claude, followed
-by a preset picker. Codex offers expert, team, and budget; the other tools offer
-team and budget. The default uses native subagents. Add
-`--tmux` to select interactive pane workers instead, for the whole session.
+| Scene | Single | Team lead | Team worker |
+| --- | --- | --- | --- |
+| daily | Sol 6.1 · xhigh | Sol 6.1 · xhigh | Sol 6.1 · xhigh |
+| hard | Astra 6 · xhigh | Astra 6 · xhigh | Sol 6.1 · xhigh |
+| batch | Luna 5.6 · xhigh | Sol 6.1 · xhigh | Luna 5.6 · xhigh |
 
 ```sh
-agent-team                         # pick agent and preset; native subagents
-agent-team --tmux                  # pick agent and preset; interactive panes
-agent-team codex                   # select directly
-agent-team claude --tmux
-agent-team opencode --team-budget --tmux
-codex-team                         # shortcut for agent-team codex
-codex-team-expert                  # Astra Medium lead + Sol High workers
-codex-team-budget --tmux           # budget shortcut
+agent-team start traex --scene daily
+agent-team start traex --scene hard --team
+agent-team start traex --scene batch --team --tmux
 ```
 
-Equivalent `traex-team`, `opencode-team`, and `claude-team` shortcuts and their
-`-budget` forms and `codex-team-expert` are installed by `python3 install.py`.
-All launch the same controller.
+Trae currently has no Luna 6 entry; batch explicitly configures Luna 5.6.
+There is no Fast tier applied. Max Mode is a separate provider feature and
+is not enabled by the scene launcher. `--check` validates model and effort
+against `traex debug models` without making an inference request.
+`--adjust quick` explicitly switches Single/the lead to Astra low.
 
-`codex-yolo`, `traex-yolo`, `claude-yolo`, and `opencode-yolo` only enable each
-CLI's permissive execution mode and forward the remaining arguments. They use
-the CLI's normal model settings and do not start a team.
+## Codex scenes
 
-`agent-team run <tool>` starts one CLI with the selected team preset's model;
-`--budget` uses its worker model and effort when configured. This path defaults
-to YOLO and supports `--no-yolo`. It does not enable delegation. The separate
-`agent-team solo` presets above keep their own model and permission settings.
-Python 3.11+ is required. tmux is required only for pane mode. These are executable wrappers,
-so shell-only aliases/functions and their permission defaults do not apply;
-Team and Team Budget default to YOLO for the lead and workers in both native
-and tmux modes. Codex/TraeX receive `--dangerously-bypass-approvals-and-sandbox`;
-Claude receives `--dangerously-skip-permissions`; OpenCode receives scoped
-`allow` permissions. Worker delegation restrictions remain enforced.
+Codex has three scenes, each available as Single or Team. Configuration is owned
+by `codex.scenes` in [teams.json](config/teams.json); Single and Team share the
+same scene, with a lead override only where needed.
 
-Use `agent-team codex --no-yolo` (also with `--tmux` / `--team-budget`) to inherit
-CLI permission settings for the whole team, or set `"yolo": false` in a preset.
-When supplying restricted permission/profile arguments, also use `--no-yolo`.
-This changes newly launched sessions; existing sessions keep their permissions.
+| Scene | Single | Team lead | Team worker | Fast |
+| --- | --- | --- | --- | --- |
+| daily · 日常开发 | GPT-6.1 Sol · max | GPT-6.1 Sol · max | GPT-6.1 Sol · max | on |
+| hard · 复杂攻坚 | GPT-6 Astra · xhigh | GPT-6 Astra · xhigh | GPT-6.1 Sol · max | off |
+| batch · 批量执行 | GPT-6 Luna · max | GPT-6.1 Sol · high | GPT-6 Luna · max | off |
+
+```sh
+agent-team start codex --scene daily
+agent-team start codex --scene hard --team
+agent-team start codex --scene batch --team --tmux
+agent-team start codex --scene daily --adjust quick
+agent-team start codex --scene batch --team --dry-run
+```
+
+The default is daily Single. `--adjust quick` temporarily selects Astra low for
+Single/the lead; it is not a fourth scene and retains the selected scene's
+Worker and Fast settings. Fast applies to the entire scene. Native subagents
+have no independently configurable speed switch; tmux workers use the same
+scene policy. The launcher validates model, reasoning effort and Fast support
+against Codex's local `models_cache.json`. Missing configuration or unsupported
+combinations fail explicitly; no automatic model or effort fallback occurs.
+Refresh Codex's model list first when the catalog is missing.
+
+`codex-team` selects daily Team and accepts `--scene`. `codex-yolo` selects daily
+Single with explicit YOLO. `codex-budget`, `codex-expert`, `codex-team-budget`
+and `codex-team-expert` are removed, including installer-owned symlinks; there
+are no compatibility aliases. Old Codex profile files are not read by scene
+launches. Old personal `codex.team`, `codex.budget`, `codex.expert` and
+`codex.solo` overrides must be migrated to `codex.scenes`.
+
+The terminal picker follows Agent → Scene → Single / Team. `--tmux` uses
+interactive pane workers for Team. Other agents retain their existing team and
+budget settings, including `traex-budget` for a single TraeX session.
+
+Team defaults to YOLO; `--no-yolo` inherits CLI permissions for the entire team.
+Single inherits CLI permissions unless the caller explicitly opts in. Existing
+sessions keep their current settings. `--dry-run` prints the resolved config
+and argv without starting a model session.
 
 Native mode uses each tool's own delegation: Codex/TraeX agent configuration,
 Claude's team-worker subagent definition, or OpenCode's team-worker definition.
@@ -138,23 +141,11 @@ and delegation rules are independent of model choices. Other tools have no
 assumed budget model: configure a distinct budget combination when desired.
 There is no automatic budget switching.
 
-Codex additionally reads the existing `team.config.toml`, `team-budget.config.toml`,
-or `team-expert.config.toml`
-profiles in CODEX_HOME (default `~/.codex`), when present. No personal profile
-is required. The bundled Codex team presets are:
+Machine-local scene overrides belong in `codex.scenes.<scene>` in
+`$XDG_CONFIG_HOME/agent-team/config.json`. Daily and hard use the same model and
+effort for Single and lead. Batch adds `lead_model` and `lead_effort`. Team
+adds `worker_model`, `worker_effort` and `limit`; `fast` is scene-wide.
 
-| Command | Lead | Workers |
-| --- | --- | --- |
-| `codex-team-expert` | GPT-6 Astra, medium | GPT-6 Sol, high |
-| `codex-team` | GPT-6 Sol, high | GPT-6 Sol, low |
-| `codex-team-budget` | GPT-6 Sol, high | GPT-6 Luna, max |
-
-The equivalent direct launch option is `agent-team codex --team-expert`.
-Solo presets above remain separate from team presets.
-
-The JSON override, when present,
-takes precedence for team settings. Command-line options passed to the lead only
-affect the lead; use worker_args or worker_model/worker_effort for child settings.
 The controller injects [shared team rules](config/team-rules.md) into each supported tool, including
 TraeX. Existing tool configuration/auth remains in place. Codex/TraeX team mode
 overrides developer_instructions; Claude appends to its system prompt; OpenCode

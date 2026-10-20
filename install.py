@@ -18,6 +18,10 @@ def install(root, bin_dir):
             if not target.is_symlink() or target.resolve() != source.resolve():
                 raise RuntimeError(f"Refusing to replace unrelated entrypoint: {target}")
     bin_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("codex-budget", "codex-expert", "codex-team-budget", "codex-team-expert"):
+        target = bin_dir / name
+        if target.is_symlink() and target.resolve() == (root / "bin" / name).resolve():
+            target.unlink()
     for source in sources:
         if not source.is_file():
             continue

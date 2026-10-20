@@ -45,7 +45,133 @@ def merge(base, extra):
     return base
 
 
+SCENES = ("daily", "hard", "batch")
+
+
+def scene_settings(scene="daily", team=False, adjustment=None, tool="codex"):
+    if scene not in SCENES:
+        fail("Unknown " + tool + " scene: " + scene)
+    config = read(CONFIG / "teams.json")[tool]
+    value = dict(config["scenes"][scene])
+    override = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-team/config.json"
+    if override.exists():
+        personal = read(override).get(tool, {})
+        obsolete = {"team", "budget", "expert", "solo"} & personal.keys()
+        if obsolete and tool == "codex":
+            fail("Migrate obsolete Codex presets in " + str(override) + " to codex.scenes before launching")
+        merge(value, personal.get("scenes", {}).get(scene, {}))
+    allowed = {"model", "effort", "lead_model", "lead_effort", "worker_model", "worker_effort", "fast", "limit", "yolo", "args", "worker_args", "env"}
+    if set(value) - allowed:
+        fail("Unknown scene settings: " + ", ".join(sorted(set(value) - allowed)))
+    for key in ("args", "worker_args"):
+        if key in value and (not isinstance(value[key], list) or not all(isinstance(arg, str) for arg in value[key])):
+            fail("Scene " + key + " must be an array of CLI arguments")
+    if "env" in value and (not isinstance(value["env"], dict) or not all(isinstance(k, str) and isinstance(v, str) for k,v in value["env"].items())):
+        fail("Scene env must map string names to string values")
+    if not isinstance(value.get("fast"), bool):
+        fail("Scene fast must be a boolean")
+    for key in ("model", "effort", "worker_model", "worker_effort"):
+        if not isinstance(value.get(key), str) or not value[key]:
+            fail("Scene " + key + " must be a nonempty string")
+    for key in ("lead_model", "lead_effort"):
+        if key in value and (not isinstance(value[key], str) or not value[key]):
+            fail("Scene " + key + " must be a nonempty string")
+    if team:
+        value["model"], value["effort"] = value.get("lead_model", value["model"]), value.get("lead_effort", value["effort"])
+    if adjustment:
+        if adjustment != "quick":
+            fail("Unknown temporary adjustment: " + adjustment)
+        value.update(config["adjustments"][adjustment])
+    value.update(scene=scene, adjustment=adjustment)
+    value.setdefault("limit", 2)
+    value.setdefault("yolo", team)
+    if not isinstance(value["yolo"], bool):
+        fail("Scene yolo must be a boolean")
+    if type(value["limit"]) is not int or not 1 <= value["limit"] <= 2:
+        fail("Team limit must be 1 or 2")
+    return value
+
+
+def validate_scene_models(cfg, team=False, tool="codex"):
+    if tool == "traex":
+        result = subprocess.run(["traex", "debug", "models"], capture_output=True, text=True, env=environment(cfg), timeout=30)
+        if result.returncode:
+            fail("Trae model catalog is unavailable; no fallback will be selected")
+        models = json.loads(result.stdout).get("models", [])
+        catalog = {alias: model for model in models for alias in (model.get("slug"), model.get("config_name")) if alias}
+        return validate_catalog(cfg, team, catalog)
+    path = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "models_cache.json"
+    if not path.exists():
+        fail("Codex model catalog is unavailable; refresh Codex's model list before launching a scene")
+    catalog = {model["slug"]: model for model in read(path).get("models", [])}
+    return validate_catalog(cfg, team, catalog)
+
+
+def validate_catalog(cfg, team, catalog):
+    roles = [(cfg["model"], cfg["effort"]) ]
+    if team:
+        roles.append((cfg["worker_model"], cfg["worker_effort"]))
+    for model, effort in roles:
+        available = catalog.get(model)
+        if not available:
+            fail("Configured model is unavailable: " + model + "; no fallback will be selected")
+        levels = {level["effort"] for level in available.get("supported_reasoning_levels", [])}
+        if effort not in levels:
+            fail("Configured reasoning effort is unavailable: " + model + " / " + effort)
+        if cfg["fast"] and "fast" not in available.get("additional_speed_tiers", []):
+            fail("Configured scene Fast mode is unavailable for " + model)
+
+
+def start_codex(argv, tool="codex"):
+    parser = argparse.ArgumentParser(prog="agent-team start " + tool)
+    parser.add_argument("--scene", choices=SCENES, default="daily")
+    parser.add_argument("--team", action="store_true")
+    parser.add_argument("--tmux", action="store_true")
+    parser.add_argument("--adjust", choices=["quick"])
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--check", action="store_true", help="Validate scene availability without starting a session")
+    parser.add_argument("--no-yolo", action="store_true")
+    # Unknown CLI arguments retain their order and are forwarded verbatim.
+    options, extra = parser.parse_known_args(argv)
+    if options.tmux and not options.team:
+        fail("--tmux requires --team")
+    cfg = scene_settings(options.scene, options.team, options.adjust, tool=tool)
+    if options.no_yolo:
+        cfg["yolo"] = False
+    if options.check:
+        validate_scene_models(cfg, options.team, tool=tool)
+        options.dry_run = True
+    if options.team:
+        flags = (["--tmux"] if options.tmux else []) + (["--team-dry-run"] if options.dry_run else [])
+        return launch(tool, flags + extra, resolved=cfg)
+    args = [tool, "-m", cfg["model"], "-c", "model_reasoning_effort=" + json.dumps(cfg["effort"])]
+    if tool == "codex":
+        args[1:1] = ["--no-daemon"]
+        args += ["-c", "plan_mode_reasoning_effort=" + json.dumps(cfg["effort"]),
+                 "-c", "service_tier=" + json.dumps("fast" if cfg["fast"] else "default"),
+                 "-c", "agents.enabled=false"]
+    else:
+        args += ["--disable", "multi_agent", "--disable", "multi_agent_v2"]
+    if cfg["yolo"]:
+        args.append("--yolo")
+    args.extend(cfg.get("args", []))
+    args.extend(extra)
+    if options.dry_run:
+        print(json.dumps({"tool":tool, "mode":"single", "scene":options.scene,
+                          "config":cfg, "argv":args}, indent=2))
+        return
+    validate_scene_models(cfg, tool=tool)
+    if not shutil.which(tool):
+        fail("CLI is not installed: " + tool)
+    env = {key:value for key,value in environment(cfg).items() if not key.startswith("AGENT_TEAM_")}
+    return os.execvpe(tool, args, env)
+
+
 def settings(tool, budget, expert=False):
+    if tool == "codex":
+        if budget or expert:
+            fail("Codex budget/expert presets were removed; use --scene daily|hard|batch")
+        return scene_settings(team=True)
     config = read(CONFIG / "teams.json")
     if expert and tool != "codex":
         fail("Expert preset is only available for Codex")
@@ -53,24 +179,6 @@ def settings(tool, budget, expert=False):
     value = config[tool][preset].copy()
     if config[tool].get("env"):
         value["env"] = dict(config[tool]["env"])
-    # Bundled team settings take precedence over optional older Codex profiles.
-    if tool == "codex":
-        import tomllib
-        profile = "team-expert" if expert else "team-budget" if budget else "team"
-        home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
-        path = home / (profile + ".config.toml")
-        if path.exists():
-            native = tomllib.loads(path.read_text())
-            mapping = {"model": "model", "model_reasoning_effort": "effort"}
-            for source, target in mapping.items():
-                if source in native and target not in value:
-                    value[target] = native[source]
-            agents = native.get("agents", {})
-            for source, target in [("default_subagent_model", "worker_model"),
-                                   ("default_subagent_reasoning_effort", "worker_effort"),
-                                   ("max_concurrent_threads_per_session", "limit")]:
-                if source in agents and target not in value:
-                    value[target] = agents[source]
     override = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-team/config.json"
     if override.exists():
         personal = read(override).get(tool, {})
@@ -101,6 +209,11 @@ def environment(cfg):
     env = os.environ.copy()
     for key, value in cfg.get("env", {}).items():
         env.setdefault(key, value)
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+        value = env.get(name) or env.get(name.lower())
+        if value:
+            env.setdefault(name, value)
+            env.setdefault(name.lower(), value)
     return env
 
 
@@ -159,7 +272,7 @@ def launch_solo(argv):
 
 def instructions(mode, worker=False, cfg=None, budget=False, expert=False):
     cfg = cfg or {}
-    selected = {"preset": "team-expert" if expert else "team-budget" if budget else "team", "mode": mode,
+    selected = {"scene": cfg.get("scene"), "fast": cfg.get("fast"), "preset": ("scene:" + cfg["scene"] + ":team") if cfg.get("scene") else ("team-expert" if expert else "team-budget" if budget else "team"), "mode": mode,
                 **{key: cfg.get(key) for key in ("model", "effort", "worker_model", "worker_effort")}}
     common = ("Resolved configuration for THIS invocation (authoritative; do not infer it "
               "from other profiles or repository examples):\n" + json.dumps(selected) + "\n"
@@ -203,11 +316,6 @@ def command(tool, cfg, mode, worker=False, extra=(), brief=None, budget=False, e
     elif yolo and tool == "claude":
         args.append("--dangerously-skip-permissions")
     if tool in ("codex", "traex"):
-        if tool == "codex" and not worker:
-            profile = "team-expert" if expert else "team-budget" if budget else "team"
-            home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
-            if (home / (profile + ".config.toml")).exists():
-                args += ["--profile", profile]
         args += ["-c", "developer_instructions=" + json.dumps(prompt)]
         if tool == "codex":
             args += ["-c", "agents.enabled=" + ("false" if disabled else "true")]
@@ -231,6 +339,10 @@ def command(tool, cfg, mode, worker=False, extra=(), brief=None, budget=False, e
                 path.write_text(role)
                 args += ["-c", "agents.team-worker.description=" + json.dumps("Independent team work using the selected worker combination")]
                 args += ["-c", "agents.team-worker.config_file=" + json.dumps(str(path))]
+        if tool == "codex" and "fast" in cfg:
+            args += ["-c", "service_tier=" + json.dumps("fast" if cfg["fast"] else "default")]
+        if effort and tool == "codex":
+            args += ["-c", "plan_mode_reasoning_effort=" + json.dumps(effort)]
         if model:
             args += ["-m", model]
         if effort:
@@ -446,7 +558,7 @@ def probe(state, role):
     return {"ok": True, "role": role, "cwd": state["cwd"], "config": state["config"]}
 
 
-def launch(tool, argv):
+def launch(tool, argv, resolved=None):
     budget = False
     expert = False
     pane_mode = False
@@ -476,7 +588,7 @@ def launch(tool, argv):
             forwarded.append(arg)
     if budget and expert:
         fail("Choose only one team preset")
-    cfg = settings(tool, budget, expert)
+    cfg = resolved if resolved is not None else settings(tool, budget, expert)
     if no_yolo:
         cfg["yolo"] = False
     mode = "tmux" if pane_mode else "native"
@@ -498,6 +610,8 @@ def launch(tool, argv):
     if dry:
         print(json.dumps({"tool": tool, "mode": mode, "config": cfg, "cwd": cwd, "argv": args}, ensure_ascii=False, indent=2))
         return
+    if tool in ("codex", "traex") and cfg.get("scene"):
+        validate_scene_models(cfg, team=True, tool=tool)
     if not shutil.which(tool):
         fail(f"CLI is not installed: {tool}")
     if not pane_mode:
@@ -512,19 +626,20 @@ def launch(tool, argv):
              "cwd": cwd, "extra": forwarded, "members": {}, "messages": [], "next_message": 1}
     write(directory / "state.json", state)
     shell_command = runner(directory, "lead")
-    environment = []
-    for key in ("PATH", "CODEX_HOME", "TRAE_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"):
-        if key in os.environ:
-            environment += ["-e", key + "=" + os.environ[key]]
+    launch_environment = environment(cfg)
+    tmux_environment = []
+    for key in ("PATH", "CODEX_HOME", "TRAE_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        if key in launch_environment:
+            tmux_environment += ["-e", key + "=" + launch_environment[key]]
     try:
         if os.environ.get("TMUX"):
             target = os.environ.get("TMUX_PANE")
             if not target:
                 fail("TMUX_PANE is required to identify the launch window")
             session = tmux("display-message", "-p", "-t", target, "#{session_id}")
-            info = tmux("new-window", "-d", "-P", "-F", "#{window_id} #{pane_id}", "-t", session, "-n", tool + "-team", "-c", state["cwd"], *environment, shell_command)
+            info = tmux("new-window", "-d", "-P", "-F", "#{window_id} #{pane_id}", "-t", session, "-n", tool + "-team", "-c", state["cwd"], *tmux_environment, shell_command)
         else:
-            info = tmux("new-session", "-d", "-P", "-F", "#{window_id} #{pane_id}", "-s", "team-" + ident, "-c", state["cwd"], *environment, shell_command)
+            info = tmux("new-session", "-d", "-P", "-F", "#{window_id} #{pane_id}", "-s", "team-" + ident, "-c", state["cwd"], *tmux_environment, shell_command)
         window, pane = info.split()
         with locked(directory) as state:
             state["socket"] = tmux("display-message", "-p", "-t", pane, "#{socket_path}")
@@ -773,6 +888,12 @@ def control(argv):
 
 def main():
     argv = sys.argv[1:]
+    if argv and argv[0] == "start":
+        if len(argv) < 2 or argv[1] not in ("codex", "traex"):
+            fail("Usage: agent-team start <codex|traex> [--scene daily|hard|batch] [--team] [--tmux]")
+        return start_codex(argv[2:], tool=argv[1])
+    if argv and argv[0] == "solo" and len(argv) > 1 and argv[1] == "codex":
+        fail("Codex solo presets were removed; use agent-team start codex --scene daily|hard|batch")
     if argv and argv[0] == "solo":
         return launch_solo(argv[1:])
     if not argv or argv == ["--tmux"]:
@@ -787,22 +908,35 @@ def main():
         if not choice.isdigit() or not 1 <= int(choice) <= len(available):
             fail("Invalid agent selection")
         tool = available[int(choice) - 1]
-        prompt = ("Preset: 1. team  2. budget  3. expert [1]: " if tool == "codex"
-                  else "Preset: 1. team  2. budget [1]: ")
+        if tool in ("codex", "traex"):
+            choice = input("场景: 1. 日常开发  2. 复杂攻坚  3. 批量执行 [1]: ").strip() or "1"
+            if choice not in ("1", "2", "3"):
+                fail("Invalid scene selection")
+            team = input("模式: 1. Single  2. Team [1]: ").strip() or "1"
+            if team not in ("1", "2"):
+                fail("Invalid mode selection")
+            flags = ["--scene", SCENES[int(choice) - 1]]
+            if team == "2":
+                flags.append("--team")
+                flags.extend(argv)
+            return start_codex(flags, tool=tool)
+        prompt = "Preset: 1. team  2. budget [1]: "
         preset = input(prompt).strip() or "1"
-        if preset not in (("1", "2", "3") if tool == "codex" else ("1", "2")):
+        if preset not in ("1", "2"):
             fail("Invalid preset selection")
-        flag = {"1": [], "2": ["--team-budget"], "3": ["--team-expert"]}[preset]
+        flag = {"1": [], "2": ["--team-budget"]}[preset]
         return launch(tool, argv + flag)
+    if argv[0] in ("codex", "traex"):
+        return start_codex(["--team", *argv[1:]], tool=argv[0])
     if argv[0] in TOOLS:
         return launch(argv[0], argv[1:])
     if argv[0] in ("-h", "--help"):
         print("Usage: agent-team [--tmux]  # choose a coding agent interactively\n"
-              "       agent-team <codex|traex|opencode|claude> [--team-budget] [--tmux] [CLI args]\n"
-              "       agent-team codex [--team-expert] [--tmux] [CLI args]\n"
-              "       agent-team solo codex <budget|expert> [Codex args]\n"
+              "       agent-team <traex|opencode|claude> [--team-budget] [--tmux] [CLI args]\n"
+              "       agent-team start <codex|traex> [--scene daily|hard|batch] [--team] [--tmux] [--adjust quick] [CLI args]\n"
+
               "       agent-team solo traex budget [TraeX args]\n"
-              "       agent-team run <codex|traex|opencode|claude> [--budget] [--no-yolo] [CLI args]\n"
+              "       agent-team run <traex|opencode|claude> [--budget] [--no-yolo] [CLI args]\n"
               "       agent-team <spawn|send|report|receive|wait|status|stop|doctor> --help\n"
               "Team default: YOLO and native subagents. --no-yolo inherits CLI permissions. --tmux: interactive pane workers only.\n"
               "--team-dry-run and --solo-dry-run print launch plans without starting an agent.\n"
@@ -812,6 +946,8 @@ def main():
         if sys.argv[2] not in TOOLS:
             fail("Unsupported CLI")
         return launch(sys.argv[2], sys.argv[3:])
+    if len(argv) > 1 and argv[:2] == ["run", "codex"]:
+        return start_codex(argv[2:])
     if len(sys.argv) > 2 and sys.argv[1] == "run":
         if sys.argv[2] not in TOOLS:
             fail("Unsupported CLI")

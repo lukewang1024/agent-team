@@ -1,2 +1,2 @@
 #!/bin/sh
-exec codex --yolo "$@"
+exec agent-team start codex --yolo "$@"

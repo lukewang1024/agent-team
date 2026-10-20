@@ -1,2 +1,0 @@
-#!/bin/sh
-exec agent-team solo codex budget "$@"

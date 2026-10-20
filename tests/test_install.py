@@ -16,8 +16,7 @@ SPEC.loader.exec_module(INSTALLER)
 class InstallTests(unittest.TestCase):
     def test_yolo_shortcuts_only_add_permission_flags(self):
         flags = {
-            'codex': '--yolo',
-            'traex': '--yolo',
+                        'traex': '--yolo',
             'claude': '--dangerously-skip-permissions',
             'opencode': '--auto',
         }
@@ -43,12 +42,25 @@ class InstallTests(unittest.TestCase):
                 INSTALLER.install(ROOT, target)
                 INSTALLER.install(ROOT, target)
             self.assertEqual((target / 'agent-team').resolve(), ROOT / 'bin/agent-team')
-            self.assertEqual((target / 'codex-budget').resolve(), ROOT / 'bin/codex-budget')
-            self.assertEqual((target / 'codex-expert').resolve(), ROOT / 'bin/codex-expert')
-            self.assertEqual((target / 'codex-team-expert').resolve(), ROOT / 'bin/codex-team-expert')
+            self.assertFalse((target / 'codex-budget').exists())
+            self.assertFalse((target / 'codex-expert').exists())
+            self.assertFalse((target / 'codex-team-expert').exists())
             self.assertEqual((target / 'traex-budget').resolve(), ROOT / 'bin/traex-budget')
             expected = len([path for path in (ROOT / 'bin').iterdir() if path.is_file()])
             self.assertEqual(len(list(target.iterdir())), expected)
+
+    def test_removed_codex_shortcuts_are_unlinked_but_unrelated_files_survive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            for name in ('codex-budget','codex-expert','codex-team-budget','codex-team-expert'):
+                (target / name).symlink_to(ROOT / 'bin' / name)
+            with contextlib.redirect_stdout(io.StringIO()):
+                INSTALLER.install(ROOT, target)
+            self.assertFalse(any((target / name).is_symlink() for name in ('codex-budget','codex-expert','codex-team-budget','codex-team-expert')))
+            owned = target / 'codex-expert'; owned.write_text('user-owned')
+            with contextlib.redirect_stdout(io.StringIO()):
+                INSTALLER.install(ROOT, target)
+            self.assertEqual(owned.read_text(), 'user-owned')
 
     def test_unrelated_entrypoint_is_preserved_before_any_install(self):
         with tempfile.TemporaryDirectory() as directory:

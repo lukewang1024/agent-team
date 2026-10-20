@@ -21,23 +21,50 @@ LOADER.exec_module(TEAM)
 
 
 class AdapterTests(unittest.TestCase):
-    def test_solo_presets_keep_codex_settings_without_team_mode(self):
-        with tempfile.TemporaryDirectory() as directory:
-            with patch.dict(os.environ, {'XDG_CONFIG_HOME': directory,
-                                          'AGENT_TEAM_ROLE': 'lead'}):
-                for preset, model, effort in (
-                    ('budget', 'gpt-6-luna', 'max'),
-                    ('expert', 'gpt-6-astra', 'medium'),
-                ):
-                    with self.subTest(preset=preset):
-                        args, env = TEAM.solo_command('codex', preset, ('resume', '--last'))
-                        self.assertEqual(args, ['codex', '--no-daemon', '-m', model, '-c',
-                                                'model_reasoning_effort=' + json.dumps(effort),
-                                                'resume', '--last'])
-                        self.assertNotIn('AGENT_TEAM_ROLE', env)
-                        self.assertNotIn('--profile', args)
-                        self.assertNotIn('--dangerously-bypass-approvals-and-sandbox', args)
-                        self.assertFalse(any('developer_instructions=' in arg for arg in args))
+    def test_trae_scenes_use_highest_advertised_effort_for_every_role(self):
+        for scene in TEAM.SCENES:
+            for team in (False, True):
+                cfg = TEAM.scene_settings(scene, team=team, tool='traex')
+                self.assertEqual(cfg['effort'], 'xhigh')
+                self.assertEqual(cfg['worker_effort'], 'xhigh')
+                self.assertFalse(cfg['fast'])
+                if scene == 'batch':
+                    self.assertEqual(cfg['model'], 'gpt-6.1-sol' if team else 'gpt-5.6-luna')
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    TEAM.start_codex(['--scene', scene, '--dry-run'] + (['--team'] if team else []), tool='traex')
+                plan = json.loads(output.getvalue())
+                self.assertEqual(plan['argv'][0], 'traex')
+                self.assertIn('model_reasoning_effort="xhigh"', plan['argv'])
+                self.assertFalse(any('service_tier=' in arg for arg in plan['argv']))
+
+    def test_single_scene_plans_use_explicit_model_effort_and_speed(self):
+        expected = {'daily': ('gpt-6.1-sol', 'max', True),
+                    'hard': ('gpt-6-astra', 'xhigh', False),
+                    'batch': ('gpt-6-luna', 'max', False)}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'XDG_CONFIG_HOME': directory}):
+            for scene, (model, effort, fast) in expected.items():
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    TEAM.start_codex(['--scene', scene, '--dry-run', 'resume', 'thread'])
+                plan = json.loads(output.getvalue())
+                self.assertEqual((plan['config']['model'], plan['config']['effort'], plan['config']['fast']),
+                                 (model, effort, fast))
+                self.assertIn('agents.enabled=false', plan['argv'])
+                self.assertIn('service_tier=' + json.dumps('fast' if fast else 'default'), plan['argv'])
+                self.assertEqual(plan['argv'][-2:], ['resume', 'thread'])
+
+    def test_trae_catalog_checks_aliases_effort_and_missing_models(self):
+        cfg = TEAM.scene_settings('hard', team=True, tool='traex')
+        catalog = {'models': [dict(slug=name.upper(), config_name=name,
+                                   supported_reasoning_levels=[{'effort': 'xhigh'}])
+                              for name in ('gpt-6-astra', 'gpt-6.1-sol')]}
+        result = subprocess.CompletedProcess([], 0, json.dumps(catalog), '')
+        with patch.object(TEAM.subprocess, 'run', return_value=result) as run:
+            TEAM.validate_scene_models(cfg, team=True, tool='traex')
+            self.assertEqual(run.call_args.args[0], ['traex', 'debug', 'models'])
+            with self.assertRaisesRegex(RuntimeError, 'reasoning effort is unavailable'):
+                TEAM.validate_scene_models(dict(cfg, effort='max'), tool='traex')
+            with self.assertRaisesRegex(RuntimeError, 'no fallback'):
+                TEAM.validate_scene_models(dict(cfg, model='gpt-6-luna'), tool='traex')
 
     def test_traex_budget_is_a_solo_wrapper_with_existing_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -46,7 +73,7 @@ class AdapterTests(unittest.TestCase):
                 args, env = TEAM.solo_command('traex', 'budget', ('resume', 'session-id'))
         self.assertEqual(args, ['traex', '--dangerously-bypass-approvals-and-sandbox',
                                 '-m', 'GPT-5.6-Luna', '-c',
-                                'model_reasoning_effort=' + json.dumps('high'),
+                                'model_reasoning_effort=' + json.dumps('xhigh'),
                                 'resume', 'session-id'])
         self.assertNotIn('AGENT_TEAM_ROLE', env)
         self.assertFalse(any('developer_instructions=' in arg for arg in args))
@@ -72,53 +99,31 @@ class AdapterTests(unittest.TestCase):
             '-c', 'model_reasoning_effort="high"', '--', '--help',
         ])
 
-    def test_solo_dry_run_preserves_codex_arguments_after_separator(self):
-        with tempfile.TemporaryDirectory() as directory:
-            with patch.dict(os.environ, {'XDG_CONFIG_HOME': directory}), \
-                    contextlib.redirect_stdout(io.StringIO()) as output:
-                TEAM.launch_solo(['codex', 'budget', '--approve-for-me',
-                                  '--solo-dry-run', '--', '--solo-dry-run'])
-            plan = json.loads(output.getvalue())
-            self.assertEqual(plan['mode'], 'solo')
-            self.assertEqual(plan['argv'][-3:], ['--approve-for-me', '--',
-                                                '--solo-dry-run'])
+    def test_scene_dry_run_preserves_cli_separator(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            TEAM.start_codex(['--dry-run', '--approve-for-me', '--', '--dry-run'])
+        self.assertEqual(json.loads(output.getvalue())['argv'][-3:], ['--approve-for-me', '--', '--dry-run'])
 
-    def test_codex_defaults_work_without_personal_profile(self):
-        with tempfile.TemporaryDirectory() as directory:
-            with patch.dict(os.environ, {'CODEX_HOME': directory, 'XDG_CONFIG_HOME': directory}):
-                combinations = (
-                    (False, True, 'gpt-6-astra', 'medium', 'gpt-6-sol', 'high'),
-                    (False, False, 'gpt-6-sol', 'high', 'gpt-6-sol', 'low'),
-                    (True, False, 'gpt-6-sol', 'high', 'gpt-6-luna', 'max'),
-                )
-                for budget, expert, model, effort, worker_model, worker_effort in combinations:
-                    with self.subTest(budget=budget, expert=expert):
-                        cfg = TEAM.settings('codex', budget, expert)
-                        self.assertEqual((cfg['model'], cfg['effort'], cfg['worker_model'],
-                                          cfg['worker_effort']),
-                                         (model, effort, worker_model, worker_effort))
-                        args, _ = TEAM.command('codex', cfg, 'native', budget=budget, expert=expert)
-                        self.assertNotIn('--profile', args)
-                        self.assertIn('--no-daemon', args)
-                        self.assertIn(model, args)
-                        self.assertIn('model_reasoning_effort="' + effort + '"', args)
-                        self.assertIn('agents.default_subagent_model="' + worker_model + '"', args)
-                        self.assertIn('agents.default_subagent_reasoning_effort="' + worker_effort + '"', args)
+    def test_team_scenes_share_worker_policy_and_speed_in_both_modes(self):
+        expected = {'daily': ('gpt-6.1-sol', 'max', 'gpt-6.1-sol', 'max', True),
+                    'hard': ('gpt-6-astra', 'xhigh', 'gpt-6.1-sol', 'max', False),
+                    'batch': ('gpt-6.1-sol', 'high', 'gpt-6-luna', 'max', False)}
+        for scene, wanted in expected.items():
+            cfg = TEAM.scene_settings(scene, team=True)
+            self.assertEqual(tuple(cfg[k] for k in ('model','effort','worker_model','worker_effort','fast')), wanted)
+            for mode in ('native', 'tmux'):
+                for worker in (False, True):
+                    args, _ = TEAM.command('codex', cfg, mode, worker=worker)
+                    self.assertNotIn('--profile', args)
+                    self.assertIn('service_tier=' + json.dumps('fast' if wanted[-1] else 'default'), args)
+                    self.assertIn(wanted[2] if worker else wanted[0], args)
 
-    def test_expert_profile_cannot_override_preset_but_json_can(self):
+    def test_obsolete_personal_presets_fail_instead_of_silently_falling_back(self):
         with tempfile.TemporaryDirectory() as directory:
-            (Path(directory) / 'team-expert.config.toml').write_text(
-                'model = "stale-model"\n[agents]\ndefault_subagent_model = "stale-worker"\n')
-            folder = Path(directory) / 'agent-team'
-            folder.mkdir()
+            folder = Path(directory) / 'agent-team'; folder.mkdir()
             (folder / 'config.json').write_text('{"codex":{"expert":{"worker_effort":"max"}}}')
-            with patch.dict(os.environ, {'CODEX_HOME': directory, 'XDG_CONFIG_HOME': directory}):
-                cfg = TEAM.settings('codex', False, True)
-                args, _ = TEAM.command('codex', cfg, 'native', expert=True)
-            self.assertEqual(cfg['model'], 'gpt-6-astra')
-            self.assertEqual(cfg['worker_model'], 'gpt-6-sol')
-            self.assertEqual(cfg['worker_effort'], 'max')
-            self.assertIn('team-expert', args)
+            with patch.dict(os.environ, {'XDG_CONFIG_HOME': directory}), self.assertRaisesRegex(RuntimeError, 'Migrate'):
+                TEAM.scene_settings('hard', True)
 
     def test_budget_prompt_matches_custom_resolved_settings(self):
         cfg = {'model': 'lead-model', 'worker_model': 'budget-worker',
@@ -185,28 +190,54 @@ class AdapterTests(unittest.TestCase):
             TEAM.main()
         launch.assert_called_once_with('claude', ['--tmux', '--team-budget'])
 
-    def test_picker_selects_codex_expert(self):
+    def test_picker_selects_codex_scene_then_mode(self):
         with patch.object(TEAM.sys, 'argv', ['agent-team']), \
                 patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \
                 patch.object(TEAM.shutil, 'which', side_effect=lambda tool: '/bin/codex' if tool == 'codex' else None), \
-                patch('builtins.input', side_effect=['1', '3']), \
-                patch.object(TEAM, 'launch') as launch, \
+                patch('builtins.input', side_effect=['1', '2', '2']), \
+                patch.object(TEAM, 'start_codex') as launch, \
                 contextlib.redirect_stdout(io.StringIO()):
             TEAM.main()
-        launch.assert_called_once_with('codex', ['--team-expert'])
+        launch.assert_called_once_with(['--scene', 'hard', '--team'], tool='codex')
 
-    def test_expert_dry_run_and_preset_conflict(self):
-        with tempfile.TemporaryDirectory() as directory:
-            with patch.dict(os.environ, {'CODEX_HOME': directory, 'XDG_CONFIG_HOME': directory}), \
-                    contextlib.redirect_stdout(io.StringIO()) as output:
-                TEAM.launch('codex', ['--team-expert', '--team-dry-run'])
-            result = json.loads(output.getvalue())
-        self.assertEqual(result['config']['worker_model'], 'gpt-6-sol')
-        self.assertIn('model_reasoning_effort="medium"', result['argv'])
-        with self.assertRaisesRegex(RuntimeError, 'only one team preset'):
-            TEAM.launch('codex', ['--team-expert', '--team-budget', '--team-dry-run'])
-        with self.assertRaisesRegex(RuntimeError, 'only available for Codex'):
-            TEAM.launch('claude', ['--team-expert', '--team-dry-run'])
+    def test_removed_presets_and_quick_adjustment(self):
+        for flags in (['--team-expert'], ['--team-budget']):
+            with self.assertRaisesRegex(RuntimeError, 'removed'):
+                TEAM.launch('codex', flags + ['--team-dry-run'])
+        cfg = TEAM.scene_settings('daily', True, 'quick')
+        self.assertEqual((cfg['model'], cfg['effort'], cfg['worker_model'], cfg['fast']),
+                         ('gpt-6-astra', 'low', 'gpt-6.1-sol', True))
+
+    def test_check_validates_scene_without_launching_an_agent(self):
+        with patch.object(TEAM, 'validate_scene_models') as validate, \
+                patch.object(TEAM.os, 'execvpe') as execute, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            TEAM.start_codex(['--scene', 'hard', '--team', '--check'])
+        validate.assert_called_once()
+        self.assertTrue(validate.call_args.args[1])
+        self.assertEqual(json.loads(output.getvalue())['config']['scene'], 'hard')
+        execute.assert_not_called()
+
+    def test_model_catalog_rejects_unavailable_models_efforts_and_fast(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'CODEX_HOME': directory}):
+            cfg = TEAM.scene_settings('daily', True)
+            with self.assertRaisesRegex(RuntimeError, 'catalog is unavailable'):
+                TEAM.validate_scene_models(cfg, True)
+            path = Path(directory) / 'models_cache.json'
+            path.write_text(json.dumps({'models': []}))
+            with self.assertRaisesRegex(RuntimeError, 'no fallback'):
+                TEAM.validate_scene_models(cfg, True)
+            model = {'slug':'gpt-6.1-sol', 'supported_reasoning_levels':[{'effort':'max'}],
+                     'additional_speed_tiers':['fast']}
+            path.write_text(json.dumps({'models':[model]}))
+            TEAM.validate_scene_models(cfg, True)
+            model['additional_speed_tiers'] = []
+            path.write_text(json.dumps({'models':[model]}))
+            with self.assertRaisesRegex(RuntimeError, 'Fast mode is unavailable'):
+                TEAM.validate_scene_models(cfg, True)
+            cfg = dict(cfg, fast=False, effort='ultra')
+            with self.assertRaisesRegex(RuntimeError, 'reasoning effort is unavailable'):
+                TEAM.validate_scene_models(cfg, True)
 
     def test_native_and_pane_modes_use_distinct_delegation(self):
         for tool in TEAM.TOOLS:
@@ -365,6 +396,29 @@ class PaneTests(unittest.TestCase):
         result = self.control('spawn', name, '--file', self.file(name + '.txt', 'Inspect one task; do not spawn agents.'))
         self.wait_for(lambda: 'interactive-ready' in self.capture(name))
         return json.loads(result)
+
+    def test_codex_scene_worker_uses_scene_model_and_shared_fast_in_real_panes(self):
+        codex_home = self.root / 'codex-home'; codex_home.mkdir()
+        (codex_home / 'models_cache.json').write_text(json.dumps({'models':[
+            {'slug':model, 'supported_reasoning_levels':[{'effort':effort} for effort in ['high','max','xhigh']], 'additional_speed_tiers':['fast']}
+            for model in ['gpt-6.1-sol','gpt-6-astra','gpt-6-luna']]}))
+        fake = self.bin / 'codex'
+        fake.write_text('#!' + os.sys.executable + '\nimport json,os,sys\nfrom pathlib import Path\nPath(os.environ["AGENT_TEAM_DIR"], os.environ["AGENT_TEAM_ROLE"]+"-argv.json").write_text(json.dumps(sys.argv[1:]))\nprint("interactive-ready",flush=True)\nfor line in sys.stdin: pass\n')
+        fake.chmod(0o755)
+        self.env['CODEX_HOME'] = str(codex_home)
+        previous = set((self.root / 'state/agent-team').iterdir())
+        with patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(io.StringIO()):
+            TEAM.start_codex(['--scene','batch','--team','--tmux'])
+        self.directory = next(path for path in (self.root / 'state/agent-team').iterdir() if path not in previous)
+        self.env['AGENT_TEAM_DIR'] = str(self.directory)
+        self.wait_for(lambda: 'interactive-ready' in self.capture('lead'))
+        self.spawn('worker_a')
+        for role, model, effort in [('lead','gpt-6.1-sol','high'), ('worker_a','gpt-6-luna','max')]:
+            args = json.loads((self.directory / (role+'-argv.json')).read_text())
+            self.assertIn(model, args)
+            self.assertIn('model_reasoning_effort=' + json.dumps(effort), args)
+            self.assertIn('service_tier="default"', args)
+        self.assertEqual(self.state()['config']['scene'], 'batch')
 
     def test_interactive_layout_cap_mailbox_reuse_and_stop(self):
         self.spawn('one')

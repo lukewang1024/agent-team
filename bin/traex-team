@@ -1,2 +1,2 @@
 #!/bin/sh
-exec agent-team launch traex "$@"
+exec agent-team start traex --team "$@"
