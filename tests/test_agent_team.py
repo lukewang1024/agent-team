@@ -37,6 +37,40 @@ class AdapterTests(unittest.TestCase):
                 self.assertIn('model_reasoning_effort="xhigh"', plan['argv'])
                 self.assertFalse(any('service_tier=' in arg for arg in plan['argv']))
 
+    def test_simple_tools_ignore_scene_options_without_injecting_models(self):
+        for tool in ('claude', 'opencode'):
+            for team in (False, True):
+                for tmux in ((False, True) if team else (False,)):
+                    flags = ['--scene', 'hard', '--adjust', 'quick', '--fast', '--dry-run']
+                    flags += ['--team'] if team else []
+                    flags += ['--tmux'] if tmux else []
+                    with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+                        TEAM.start_simple(flags, tool)
+                    plan = json.loads(out.getvalue())
+                    self.assertEqual(plan['argv'][0], tool)
+                    self.assertEqual(err.getvalue().count('not applied'), 1)
+                    for flag in ('--scene', '--adjust', '--fast', '--model', '--effort'):
+                        self.assertNotIn(flag, plan['argv'])
+                    self.assertNotIn('model', plan['config'])
+                    self.assertEqual(plan['mode'], ('tmux' if tmux else 'native') if team else 'single')
+                    if tool == 'opencode' and team:
+                        args, env = TEAM.command(tool, plan['config'], plan['mode'])
+                        for agent in json.loads(env['OPENCODE_CONFIG_CONTENT'])['agent'].values():
+                            self.assertNotIn('model', agent)
+                            self.assertNotIn('reasoningEffort', agent)
+
+    def test_simple_single_preserves_native_arguments_and_separator(self):
+        with patch.object(TEAM.os, 'execvpe') as execute, patch.object(TEAM.shutil, 'which', return_value='/bin/tool'):
+            TEAM.start_simple(['--model', 'chosen', '--', '--scene', 'hard'], 'claude')
+        self.assertEqual(execute.call_args.args[1], ['claude', '--model', 'chosen', '--', '--scene', 'hard'])
+
+    def test_simple_check_never_starts_a_cli_and_tmux_requires_team(self):
+        with patch.object(TEAM.os, 'execvpe') as execute, patch.object(TEAM.shutil, 'which', return_value='/bin/tool'), contextlib.redirect_stdout(io.StringIO()):
+            TEAM.start_simple(['--check'], 'opencode')
+            execute.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, '--tmux requires --team'):
+            TEAM.start_simple(['--tmux'], 'claude')
+
     def test_single_scene_plans_use_explicit_model_effort_and_speed(self):
         expected = {'daily': ('gpt-6.1-sol', 'max', True),
                     'hard': ('gpt-6-astra', 'xhigh', False),
@@ -185,10 +219,10 @@ class AdapterTests(unittest.TestCase):
                 patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \
                 patch.object(TEAM.shutil, 'which', return_value='/bin/tool'), \
                 patch('builtins.input', side_effect=['4', '2']), \
-                patch.object(TEAM, 'launch') as launch, \
+                patch.object(TEAM, 'start_simple') as launch, \
                 contextlib.redirect_stdout(io.StringIO()):
             TEAM.main()
-        launch.assert_called_once_with('claude', ['--tmux', '--team-budget'])
+        launch.assert_called_once_with(['--team', '--tmux'], tool='claude')
 
     def test_picker_selects_codex_scene_then_mode(self):
         with patch.object(TEAM.sys, 'argv', ['agent-team']), \

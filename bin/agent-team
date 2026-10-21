@@ -167,6 +167,43 @@ def start_codex(argv, tool="codex"):
     return os.execvpe(tool, args, env)
 
 
+def start_simple(argv, tool):
+    """Launch infrequently used tools without imposing a model scene."""
+    parser = argparse.ArgumentParser(prog="agent-team start " + tool, allow_abbrev=False)
+    parser.add_argument("--team", action="store_true")
+    parser.add_argument("--tmux", action="store_true")
+    parser.add_argument("--scene", choices=SCENES)
+    parser.add_argument("--adjust", choices=["quick"])
+    parser.add_argument("--fast", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--no-yolo", action="store_true")
+    options, extra = parser.parse_known_args(argv)
+    if options.tmux and not options.team:
+        fail("--tmux requires --team")
+    if options.scene is not None or options.adjust is not None or options.fast is not None:
+        print(tool + ": scene/adjust/Fast options are not applied; using tool defaults", file=sys.stderr)
+    if options.check and not shutil.which(tool):
+        fail("CLI is not installed: " + tool)
+    if options.team:
+        cfg = settings(tool, False)
+        if options.no_yolo:
+            cfg["yolo"] = False
+        flags = (["--tmux"] if options.tmux else [])
+        if options.dry_run or options.check:
+            flags.append("--team-dry-run")
+        return launch(tool, flags + extra, resolved=cfg)
+    cfg = {"env": read(CONFIG / "teams.json")[tool].get("env", {})}
+    args = [tool] + extra
+    if options.dry_run or options.check:
+        print(json.dumps({"tool": tool, "mode": "single", "config": cfg, "argv": args}, indent=2))
+        return
+    if not shutil.which(tool):
+        fail("CLI is not installed: " + tool)
+    env = {key: value for key, value in environment(cfg).items() if not key.startswith("AGENT_TEAM_")}
+    return os.execvpe(tool, args, env)
+
+
 def settings(tool, budget, expert=False):
     if tool == "codex":
         if budget or expert:
@@ -889,8 +926,10 @@ def control(argv):
 def main():
     argv = sys.argv[1:]
     if argv and argv[0] == "start":
-        if len(argv) < 2 or argv[1] not in ("codex", "traex"):
-            fail("Usage: agent-team start <codex|traex> [--scene daily|hard|batch] [--team] [--tmux]")
+        if len(argv) < 2 or argv[1] not in TOOLS:
+            fail("Usage: agent-team start <codex|traex|claude|opencode> [--scene daily|hard|batch] [--team] [--tmux]")
+        if argv[1] in ("claude", "opencode"):
+            return start_simple(argv[2:], tool=argv[1])
         return start_codex(argv[2:], tool=argv[1])
     if argv and argv[0] == "solo" and len(argv) > 1 and argv[1] == "codex":
         fail("Codex solo presets were removed; use agent-team start codex --scene daily|hard|batch")
@@ -920,12 +959,11 @@ def main():
                 flags.append("--team")
                 flags.extend(argv)
             return start_codex(flags, tool=tool)
-        prompt = "Preset: 1. team  2. budget [1]: "
-        preset = input(prompt).strip() or "1"
-        if preset not in ("1", "2"):
-            fail("Invalid preset selection")
-        flag = {"1": [], "2": ["--team-budget"]}[preset]
-        return launch(tool, argv + flag)
+        mode = input("模式: 1. Single  2. Team [1]: ").strip() or "1"
+        if mode not in ("1", "2"):
+            fail("Invalid mode selection")
+        flags = ["--team", *argv] if mode == "2" else []
+        return start_simple(flags, tool=tool)
     if argv[0] in ("codex", "traex"):
         return start_codex(["--team", *argv[1:]], tool=argv[0])
     if argv[0] in TOOLS:
@@ -933,7 +971,7 @@ def main():
     if argv[0] in ("-h", "--help"):
         print("Usage: agent-team [--tmux]  # choose a coding agent interactively\n"
               "       agent-team <traex|opencode|claude> [--team-budget] [--tmux] [CLI args]\n"
-              "       agent-team start <codex|traex> [--scene daily|hard|batch] [--team] [--tmux] [--adjust quick] [CLI args]\n"
+              "       agent-team start <codex|traex|claude|opencode> [--scene daily|hard|batch] [--team] [--tmux] [--adjust quick] [CLI args]\n"
 
               "       agent-team solo traex budget [TraeX args]\n"
               "       agent-team run <traex|opencode|claude> [--budget] [--no-yolo] [CLI args]\n"

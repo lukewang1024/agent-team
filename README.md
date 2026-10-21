@@ -30,6 +30,26 @@ The installer links the commands into `~/.local/bin`; ensure it is on `PATH`.
 The installer refuses to overwrite unrelated files. Keep the checkout in place.
 It does not change authentication, global CLI configuration, or global permission defaults.
 
+## Claude and OpenCode
+
+These tools use a simple Single / Team launch flow and their default models.
+Single adds no model, reasoning or permission overrides. Team retains the
+existing delegation backend and permission policy; explicit personal team
+settings remain supported. Native CLI arguments such as `--model` are forwarded.
+
+```sh
+agent-team start claude
+agent-team start opencode --team
+agent-team start claude --team --tmux
+```
+
+For uniform callers, explicit `--scene`, `--adjust quick`, `--fast` and
+`--no-fast` are accepted but ignored with one notice on stderr. They never
+select a model or reasoning level for these tools. `--team` and `--tmux`
+remain effective; `--tmux` requires Team. The interactive picker asks only
+Single or Team. Older explicit budget commands remain available for existing
+scripts, but are not offered in the picker or Workbench menu.
+
 ## Trae scenes
 
 Trae uses the same `daily`, `hard`, and `batch` scene interface. All roles use
@@ -89,9 +109,10 @@ are no compatibility aliases. Old Codex profile files are not read by scene
 launches. Old personal `codex.team`, `codex.budget`, `codex.expert` and
 `codex.solo` overrides must be migrated to `codex.scenes`.
 
-The terminal picker follows Agent → Scene → Single / Team. `--tmux` uses
-interactive pane workers for Team. Other agents retain their existing team and
-budget settings, including `traex-budget` for a single TraeX session.
+For Codex and Trae, the terminal picker follows Agent → Scene → Single / Team.
+Claude and OpenCode skip the scene step. `--tmux` uses interactive pane workers
+for Team. Explicit legacy non-Codex budget commands remain available, including
+`traex-budget` for a single TraeX session.
 
 Team defaults to YOLO; `--no-yolo` inherits CLI permissions for the entire team.
 Single inherits CLI permissions unless the caller explicitly opts in. Existing
