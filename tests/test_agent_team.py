@@ -273,6 +273,45 @@ class AdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'reasoning effort is unavailable'):
                 TEAM.validate_scene_models(cfg, True)
 
+    def test_codex_launch_is_not_blocked_by_missing_or_outdated_cache(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                'CODEX_HOME': directory, 'XDG_CONFIG_HOME': directory}):
+            path = Path(directory) / 'models_cache.json'
+            for cache in (None, '{"models": []}', 'incomplete cache'):
+                if cache is not None:
+                    path.write_text(cache)
+                for team in (False, True):
+                    with self.subTest(cache=cache, team=team), \
+                            patch.object(TEAM.shutil, 'which', return_value='/bin/codex'), \
+                            patch.object(TEAM.os, 'execvpe') as execute:
+                        TEAM.start_codex(['--team'] if team else ['--yolo'])
+                    args = execute.call_args.args[1]
+                    self.assertEqual(args[args.index('-m') + 1], 'gpt-6.1-sol')
+                    self.assertIn('model_reasoning_effort="max"', args)
+                    self.assertIn('service_tier="fast"', args)
+                    self.assertTrue('--yolo' in args or '--dangerously-bypass-approvals-and-sandbox' in args)
+
+    def test_check_still_reports_missing_model_without_launching_codex(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                'CODEX_HOME': directory, 'XDG_CONFIG_HOME': directory}):
+            (Path(directory) / 'models_cache.json').write_text('{"models": []}')
+            for team in (False, True):
+                with self.subTest(team=team), patch.object(TEAM.os, 'execvpe') as execute:
+                    with self.assertRaisesRegex(RuntimeError, 'no fallback'):
+                        TEAM.start_codex(['--check'] + (['--team'] if team else []))
+                    execute.assert_not_called()
+
+    def test_trae_launches_still_validate_live_catalog_before_exec(self):
+        for team in (False, True):
+            with self.subTest(team=team), \
+                    patch.object(TEAM, 'validate_scene_models', side_effect=RuntimeError('catalog rejected')) as validate, \
+                    patch.object(TEAM.os, 'execvpe') as execute:
+                with self.assertRaisesRegex(RuntimeError, 'catalog rejected'):
+                    TEAM.start_codex(['--team'] if team else [], tool='traex')
+                validate.assert_called_once()
+                self.assertEqual(validate.call_args.kwargs['tool'], 'traex')
+                execute.assert_not_called()
+
     def test_native_and_pane_modes_use_distinct_delegation(self):
         for tool in TEAM.TOOLS:
             for mode in ('native', 'tmux'):

@@ -97,10 +97,13 @@ The default is daily Single. `--adjust quick` temporarily selects Astra low for
 Single/the lead; it is not a fourth scene and retains the selected scene's
 Worker and Fast settings. Fast applies to the entire scene. Native subagents
 have no independently configurable speed switch; tmux workers use the same
-scene policy. The launcher validates model, reasoning effort and Fast support
-against Codex's local `models_cache.json`. Missing configuration or unsupported
-combinations fail explicitly; no automatic model or effort fallback occurs.
-Refresh Codex's model list first when the catalog is missing.
+scene policy. Codex launches receive the configured model, reasoning effort and
+Fast settings unchanged and let Codex refresh its model catalog during startup.
+An outdated or missing `models_cache.json` cannot block a launch before Codex
+has a chance to refresh it. `--check` explicitly validates these settings against
+that local cache; refresh the catalog in Codex if this diagnostic is outdated.
+The launcher never selects a fallback model or effort. Trae launches continue
+to validate against the live `traex debug models` catalog.
 
 `codex-team` selects daily Team and accepts `--scene`. `codex-yolo` selects daily
 Single with explicit YOLO. `codex-budget`, `codex-expert`, `codex-team-budget`

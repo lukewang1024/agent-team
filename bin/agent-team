@@ -160,7 +160,10 @@ def start_codex(argv, tool="codex"):
         print(json.dumps({"tool":tool, "mode":"single", "scene":options.scene,
                           "config":cfg, "argv":args}, indent=2))
         return
-    validate_scene_models(cfg, tool=tool)
+    # The disk catalog can predate a model rollout. Let Codex refresh it during
+    # startup; only the explicit --check diagnostic validates this cached list.
+    if tool == "traex":
+        validate_scene_models(cfg, tool=tool)
     if not shutil.which(tool):
         fail("CLI is not installed: " + tool)
     env = {key:value for key,value in environment(cfg).items() if not key.startswith("AGENT_TEAM_")}
@@ -647,7 +650,7 @@ def launch(tool, argv, resolved=None):
     if dry:
         print(json.dumps({"tool": tool, "mode": mode, "config": cfg, "cwd": cwd, "argv": args}, ensure_ascii=False, indent=2))
         return
-    if tool in ("codex", "traex") and cfg.get("scene"):
+    if tool == "traex" and cfg.get("scene"):
         validate_scene_models(cfg, team=True, tool=tool)
     if not shutil.which(tool):
         fail(f"CLI is not installed: {tool}")
