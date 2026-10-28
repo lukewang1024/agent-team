@@ -45,13 +45,17 @@ def merge(base, extra):
     return base
 
 
-SCENES = ("daily", "hard", "batch")
+SCENE_LABELS = {"daily": "日常开发", "hard": "复杂攻坚", "batch": "批量执行", "computer": "电脑自动化"}
+
+
+def scene_names(tool="codex"):
+    return tuple(read(CONFIG / "teams.json")[tool]["scenes"])
 
 
 def scene_settings(scene="daily", team=False, adjustment=None, tool="codex"):
-    if scene not in SCENES:
-        fail("Unknown " + tool + " scene: " + scene)
     config = read(CONFIG / "teams.json")[tool]
+    if scene not in config["scenes"]:
+        fail("Unknown " + tool + " scene: " + scene)
     value = dict(config["scenes"][scene])
     override = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-team/config.json"
     if override.exists():
@@ -124,7 +128,7 @@ def validate_catalog(cfg, team, catalog):
 
 def start_codex(argv, tool="codex"):
     parser = argparse.ArgumentParser(prog="agent-team start " + tool)
-    parser.add_argument("--scene", choices=SCENES, default="daily")
+    parser.add_argument("--scene", choices=scene_names(tool), default="daily")
     parser.add_argument("--team", action="store_true")
     parser.add_argument("--tmux", action="store_true")
     parser.add_argument("--adjust", choices=["quick"])
@@ -175,7 +179,7 @@ def start_simple(argv, tool):
     parser = argparse.ArgumentParser(prog="agent-team start " + tool, allow_abbrev=False)
     parser.add_argument("--team", action="store_true")
     parser.add_argument("--tmux", action="store_true")
-    parser.add_argument("--scene", choices=SCENES)
+    parser.add_argument("--scene", choices=scene_names())
     parser.add_argument("--adjust", choices=["quick"])
     parser.add_argument("--fast", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--dry-run", action="store_true")
@@ -210,7 +214,7 @@ def start_simple(argv, tool):
 def settings(tool, budget, expert=False):
     if tool == "codex":
         if budget or expert:
-            fail("Codex budget/expert presets were removed; use --scene daily|hard|batch")
+            fail("Codex budget/expert presets were removed; use --scene " + "|".join(scene_names()))
         return scene_settings(team=True)
     config = read(CONFIG / "teams.json")
     if expert and tool != "codex":
@@ -930,12 +934,12 @@ def main():
     argv = sys.argv[1:]
     if argv and argv[0] == "start":
         if len(argv) < 2 or argv[1] not in TOOLS:
-            fail("Usage: agent-team start <codex|traex|claude|opencode> [--scene daily|hard|batch] [--team] [--tmux]")
+            fail("Usage: agent-team start <codex|traex|claude|opencode> [--scene SCENE] [--team] [--tmux]")
         if argv[1] in ("claude", "opencode"):
             return start_simple(argv[2:], tool=argv[1])
         return start_codex(argv[2:], tool=argv[1])
     if argv and argv[0] == "solo" and len(argv) > 1 and argv[1] == "codex":
-        fail("Codex solo presets were removed; use agent-team start codex --scene daily|hard|batch")
+        fail("Codex solo presets were removed; use agent-team start codex --scene " + "|".join(scene_names()))
     if argv and argv[0] == "solo":
         return launch_solo(argv[1:])
     if not argv or argv == ["--tmux"]:
@@ -951,13 +955,15 @@ def main():
             fail("Invalid agent selection")
         tool = available[int(choice) - 1]
         if tool in ("codex", "traex"):
-            choice = input("场景: 1. 日常开发  2. 复杂攻坚  3. 批量执行 [1]: ").strip() or "1"
-            if choice not in ("1", "2", "3"):
+            scenes = scene_names(tool)
+            labels = "  ".join(f"{number}. {SCENE_LABELS.get(scene, scene)}" for number, scene in enumerate(scenes, 1))
+            choice = input("场景: " + labels + " [1]: ").strip() or "1"
+            if not choice.isdigit() or not 1 <= int(choice) <= len(scenes):
                 fail("Invalid scene selection")
             team = input("模式: 1. Single  2. Team [1]: ").strip() or "1"
             if team not in ("1", "2"):
                 fail("Invalid mode selection")
-            flags = ["--scene", SCENES[int(choice) - 1]]
+            flags = ["--scene", scenes[int(choice) - 1]]
             if team == "2":
                 flags.append("--team")
                 flags.extend(argv)
@@ -974,7 +980,8 @@ def main():
     if argv[0] in ("-h", "--help"):
         print("Usage: agent-team [--tmux]  # choose a coding agent interactively\n"
               "       agent-team <traex|opencode|claude> [--team-budget] [--tmux] [CLI args]\n"
-              "       agent-team start <codex|traex|claude|opencode> [--scene daily|hard|batch] [--team] [--tmux] [--adjust quick] [CLI args]\n"
+              "       agent-team start <codex|traex|claude|opencode> [--scene SCENE] [--team] [--tmux] [--adjust quick] [CLI args]\n"
+              "Codex scenes: daily|hard|batch|computer. Trae scenes: daily|hard|batch.\n"
 
               "       agent-team solo traex budget [TraeX args]\n"
               "       agent-team run <traex|opencode|claude> [--budget] [--no-yolo] [CLI args]\n"

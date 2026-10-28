@@ -75,7 +75,7 @@ against `traex debug models` without making an inference request.
 
 ## Codex scenes
 
-Codex has three scenes, each available as Single or Team. Configuration is owned
+Codex has four scenes, each available as Single or Team. Configuration is owned
 by `codex.scenes` in [teams.json](config/teams.json); Single and Team share the
 same scene, with a lead override only where needed.
 
@@ -84,6 +84,7 @@ same scene, with a lead override only where needed.
 | daily · 日常开发 | GPT-6.1 Sol · max | GPT-6.1 Sol · max | GPT-6.1 Sol · max | on |
 | hard · 复杂攻坚 | GPT-6 Astra · xhigh | GPT-6 Astra · xhigh | GPT-6.1 Sol · max | off |
 | batch · 批量执行 | GPT-6 Luna · max | GPT-6.1 Sol · high | GPT-6 Luna · max | off |
+| computer · 电脑自动化 | GPT-6.1 Terra · max | GPT-6.1 Terra · max | GPT-6.1 Terra · max | off |
 
 ```sh
 agent-team start codex --scene daily
@@ -91,10 +92,18 @@ agent-team start codex --scene hard --team
 agent-team start codex --scene batch --team --tmux
 agent-team start codex --scene daily --adjust quick
 agent-team start codex --scene batch --team --dry-run
+agent-team start codex --scene computer
+agent-team start codex --scene computer --team --check
 ```
 
+`computer` selects Terra max for browser and desktop automation, including visual
+inspection and actions in apps. It uses the existing computer-use tools and
+skills; the scene does not install a desktop driver. Team uses Terra max for
+every role. Give one agent ownership of a desktop at a time, or assign separate
+desktops to parallel workers. Trae retains its three existing scenes.
+
 The default is daily Single. `--adjust quick` temporarily selects Astra low for
-Single/the lead; it is not a fourth scene and retains the selected scene's
+Single/the lead; it is not a separate scene and retains the selected scene's
 Worker and Fast settings. Fast applies to the entire scene. Native subagents
 have no independently configurable speed switch; tmux workers use the same
 scene policy. Codex launches receive the configured model, reasoning effort and
@@ -166,8 +175,8 @@ assumed budget model: configure a distinct budget combination when desired.
 There is no automatic budget switching.
 
 Machine-local scene overrides belong in `codex.scenes.<scene>` in
-`$XDG_CONFIG_HOME/agent-team/config.json`. Daily and hard use the same model and
-effort for Single and lead. Batch adds `lead_model` and `lead_effort`. Team
+`$XDG_CONFIG_HOME/agent-team/config.json`. Daily, hard and computer use the same
+model and effort for Single and lead. Batch adds `lead_model` and `lead_effort`. Team
 adds `worker_model`, `worker_effort` and `limit`; `fast` is scene-wide.
 
 The controller injects [shared team rules](config/team-rules.md) into each supported tool, including

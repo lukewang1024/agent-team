@@ -23,6 +23,13 @@
         "lead_effort": "high",
         "worker_model": "gpt-6-luna",
         "worker_effort": "max"
+      },
+      "computer": {
+        "model": "gpt-6.1-terra",
+        "effort": "max",
+        "fast": false,
+        "worker_model": "gpt-6.1-terra",
+        "worker_effort": "max"
       }
     },
     "adjustments": {

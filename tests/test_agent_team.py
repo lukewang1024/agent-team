@@ -22,7 +22,7 @@ LOADER.exec_module(TEAM)
 
 class AdapterTests(unittest.TestCase):
     def test_trae_scenes_use_highest_advertised_effort_for_every_role(self):
-        for scene in TEAM.SCENES:
+        for scene in TEAM.scene_names('traex'):
             for team in (False, True):
                 cfg = TEAM.scene_settings(scene, team=team, tool='traex')
                 self.assertEqual(cfg['effort'], 'xhigh')
@@ -74,7 +74,8 @@ class AdapterTests(unittest.TestCase):
     def test_single_scene_plans_use_explicit_model_effort_and_speed(self):
         expected = {'daily': ('gpt-6.1-sol', 'max', True),
                     'hard': ('gpt-6-astra', 'xhigh', False),
-                    'batch': ('gpt-6-luna', 'max', False)}
+                    'batch': ('gpt-6-luna', 'max', False),
+                    'computer': ('gpt-6.1-terra', 'max', False)}
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'XDG_CONFIG_HOME': directory}):
             for scene, (model, effort, fast) in expected.items():
                 with contextlib.redirect_stdout(io.StringIO()) as output:
@@ -141,7 +142,8 @@ class AdapterTests(unittest.TestCase):
     def test_team_scenes_share_worker_policy_and_speed_in_both_modes(self):
         expected = {'daily': ('gpt-6.1-sol', 'max', 'gpt-6.1-sol', 'max', True),
                     'hard': ('gpt-6-astra', 'xhigh', 'gpt-6.1-sol', 'max', False),
-                    'batch': ('gpt-6.1-sol', 'high', 'gpt-6-luna', 'max', False)}
+                    'batch': ('gpt-6.1-sol', 'high', 'gpt-6-luna', 'max', False),
+                    'computer': ('gpt-6.1-terra', 'max', 'gpt-6.1-terra', 'max', False)}
         for scene, wanted in expected.items():
             cfg = TEAM.scene_settings(scene, team=True)
             self.assertEqual(tuple(cfg[k] for k in ('model','effort','worker_model','worker_effort','fast')), wanted)
@@ -225,14 +227,29 @@ class AdapterTests(unittest.TestCase):
         launch.assert_called_once_with(['--team', '--tmux'], tool='claude')
 
     def test_picker_selects_codex_scene_then_mode(self):
-        with patch.object(TEAM.sys, 'argv', ['agent-team']), \
-                patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \
-                patch.object(TEAM.shutil, 'which', side_effect=lambda tool: '/bin/codex' if tool == 'codex' else None), \
-                patch('builtins.input', side_effect=['1', '2', '2']), \
-                patch.object(TEAM, 'start_codex') as launch, \
-                contextlib.redirect_stdout(io.StringIO()):
-            TEAM.main()
-        launch.assert_called_once_with(['--scene', 'hard', '--team'], tool='codex')
+        for tool, choice, scene, mode in [('codex', '2', 'hard', '2'),
+                                         ('codex', '4', 'computer', '1'),
+                                         ('codex', '4', 'computer', '2'),
+                                         ('traex', '3', 'batch', '1')]:
+            with self.subTest(tool=tool, scene=scene, mode=mode), \
+                    patch.object(TEAM.sys, 'argv', ['agent-team']), \
+                    patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \
+                    patch.object(TEAM.shutil, 'which', side_effect=lambda name: '/bin/tool' if name == tool else None), \
+                    patch('builtins.input', side_effect=['1', choice, mode]) as ask, \
+                    patch.object(TEAM, 'start_codex') as launch, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                TEAM.main()
+            flags = ['--scene', scene] + (['--team'] if mode == '2' else [])
+            launch.assert_called_once_with(flags, tool=tool)
+            self.assertEqual('电脑自动化' in ask.call_args_list[1].args[0], tool == 'codex')
+
+    def test_computer_scene_is_not_available_to_trae(self):
+        with self.assertRaisesRegex(RuntimeError, 'Unknown traex scene: computer'):
+            TEAM.scene_settings('computer', tool='traex')
+        with patch.object(TEAM.os, 'execvpe') as execute, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                TEAM.start_codex(['--scene', 'computer', '--dry-run'], tool='traex')
+            execute.assert_not_called()
 
     def test_removed_presets_and_quick_adjustment(self):
         for flags in (['--team-expert'], ['--team-budget']):
@@ -474,24 +491,27 @@ class PaneTests(unittest.TestCase):
         codex_home = self.root / 'codex-home'; codex_home.mkdir()
         (codex_home / 'models_cache.json').write_text(json.dumps({'models':[
             {'slug':model, 'supported_reasoning_levels':[{'effort':effort} for effort in ['high','max','xhigh']], 'additional_speed_tiers':['fast']}
-            for model in ['gpt-6.1-sol','gpt-6-astra','gpt-6-luna']]}))
+            for model in ['gpt-6.1-sol','gpt-6-astra','gpt-6-luna','gpt-6.1-terra']]}))
         fake = self.bin / 'codex'
         fake.write_text('#!' + os.sys.executable + '\nimport json,os,sys\nfrom pathlib import Path\nPath(os.environ["AGENT_TEAM_DIR"], os.environ["AGENT_TEAM_ROLE"]+"-argv.json").write_text(json.dumps(sys.argv[1:]))\nprint("interactive-ready",flush=True)\nfor line in sys.stdin: pass\n')
         fake.chmod(0o755)
         self.env['CODEX_HOME'] = str(codex_home)
-        previous = set((self.root / 'state/agent-team').iterdir())
-        with patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(io.StringIO()):
-            TEAM.start_codex(['--scene','batch','--team','--tmux'])
-        self.directory = next(path for path in (self.root / 'state/agent-team').iterdir() if path not in previous)
-        self.env['AGENT_TEAM_DIR'] = str(self.directory)
-        self.wait_for(lambda: 'interactive-ready' in self.capture('lead'))
-        self.spawn('worker_a')
-        for role, model, effort in [('lead','gpt-6.1-sol','high'), ('worker_a','gpt-6-luna','max')]:
-            args = json.loads((self.directory / (role+'-argv.json')).read_text())
-            self.assertIn(model, args)
-            self.assertIn('model_reasoning_effort=' + json.dumps(effort), args)
-            self.assertIn('service_tier="default"', args)
-        self.assertEqual(self.state()['config']['scene'], 'batch')
+        for scene, roles in [('batch', [('lead','gpt-6.1-sol','high'), ('worker_a','gpt-6-luna','max')]),
+                             ('computer', [('lead','gpt-6.1-terra','max'), ('worker_a','gpt-6.1-terra','max')])]:
+            with self.subTest(scene=scene):
+                previous = set((self.root / 'state/agent-team').iterdir())
+                with patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(io.StringIO()):
+                    TEAM.start_codex(['--scene',scene,'--team','--tmux'])
+                self.directory = next(path for path in (self.root / 'state/agent-team').iterdir() if path not in previous)
+                self.env['AGENT_TEAM_DIR'] = str(self.directory)
+                self.wait_for(lambda: 'interactive-ready' in self.capture('lead'))
+                self.spawn('worker_a')
+                for role, model, effort in roles:
+                    args = json.loads((self.directory / (role+'-argv.json')).read_text())
+                    self.assertIn(model, args)
+                    self.assertIn('model_reasoning_effort=' + json.dumps(effort), args)
+                    self.assertIn('service_tier="default"', args)
+                self.assertEqual(self.state()['config']['scene'], scene)
 
     def test_interactive_layout_cap_mailbox_reuse_and_stop(self):
         self.spawn('one')
