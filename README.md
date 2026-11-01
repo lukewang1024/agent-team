@@ -73,58 +73,46 @@ is not enabled by the scene launcher. `--check` validates model and effort
 against `traex debug models` without making an inference request.
 `--adjust quick` explicitly switches Single/the lead to Astra low.
 
-## Codex scenes
+## CodexRadar recommendations
 
-Codex has four scenes, each available as Single or Team. Configuration is owned
-by `codex.scenes` in [teams.json](config/teams.json); Single and Team share the
-same scene, with a lead override only where needed.
+The Codex Create Agent menu reads the remote station-recommendation cache. It
+shows the first four distinct categories in the source order and keeps the
+newest model version within each category. Category names and model/effort pairs
+remain remote-driven; the menu limit is configurable in `config/codexradar.json`.
+Codex defaults are used only when no recommendations are available. Fast is
+always off by default and is not read from the recommendation data; enable it
+explicitly with `--fast`.
 
-| Scene | Single | Team lead | Team worker | Fast |
-| --- | --- | --- | --- | --- |
-| daily · 日常开发 | GPT-6.1 Sol · max | GPT-6.1 Sol · max | GPT-6.1 Sol · max | on |
-| hard · 复杂攻坚 | GPT-6 Astra · xhigh | GPT-6 Astra · xhigh | GPT-6.1 Sol · max | off |
-| batch · 批量执行 | GPT-6 Luna · max | GPT-6.1 Sol · high | GPT-6 Luna · max | off |
-| computer · 电脑自动化 | GPT-6.1 Terra · max | GPT-6.1 Terra · max | GPT-6.1 Terra · max | off |
+The menu prepares recommendations only when Create Agent → Codex opens. It
+tries the recommendations JSON endpoint first, then parses the homepage's
+Station Picks section if that endpoint is unavailable. It fetches synchronously
+if no valid cache exists. When a valid cache is at least 24 hours old, it
+refreshes in the background and keeps using the active cache; a successful
+refresh is promoted on the next menu open. Direct Codex launches read the cache
+without fetching.
 
 ```sh
-agent-team start codex --scene daily
-agent-team start codex --scene hard --team
-agent-team start codex --scene batch --team --tmux
-agent-team start codex --scene daily --adjust quick
-agent-team start codex --scene batch --team --dry-run
-agent-team start codex --scene computer
-agent-team start codex --scene computer --team --check
+agent-team recommendations status
+agent-team start codex --recommendation <ID>
+agent-team start codex --recommendation <ID> --team
+agent-team start codex --recommendation <ID> --team --tmux
+agent-team start codex --recommendation <ID> --fast
+agent-team start codex --team --dry-run
 ```
 
-`computer` selects Terra max for browser and desktop automation, including visual
-inspection and actions in apps. It uses the existing computer-use tools and
-skills; the scene does not install a desktop driver. Team uses Terra max for
-every role. Give one agent ownership of a desktop at a time, or assign separate
-desktops to parallel workers. Trae retains its three existing scenes.
+Use the `id` from `agent-team recommendations status` when selecting a
+recommendation directly. Cache files live under `$XDG_CACHE_HOME/agent-team`
+(default `~/.cache/agent-team`). If the first fetch fails or returns no usable
+recommendations, the menu shows no hard-coded Codex tiers and still allows
+Codex to start with its native defaults. The empty cache is retried after five
+minutes on a later menu visit. Missing or stale recommendation data never
+blocks agent creation.
 
-The default is daily Single. `--adjust quick` temporarily selects Astra low for
-Single/the lead; it is not a separate scene and retains the selected scene's
-Worker and Fast settings. Fast applies to the entire scene. Native subagents
-have no independently configurable speed switch; tmux workers use the same
-scene policy. Codex launches receive the configured model, reasoning effort and
-Fast settings unchanged and let Codex refresh its model catalog during startup.
-An outdated or missing `models_cache.json` cannot block a launch before Codex
-has a chance to refresh it. `--check` explicitly validates these settings against
-that local cache; refresh the catalog in Codex if this diagnostic is outdated.
-The launcher never selects a fallback model or effort. Trae launches continue
-to validate against the live `traex debug models` catalog.
-
-`codex-team` selects daily Team and accepts `--scene`. `codex-yolo` selects daily
-Single with explicit YOLO. `codex-budget`, `codex-expert`, `codex-team-budget`
-and `codex-team-expert` are removed, including installer-owned symlinks; there
-are no compatibility aliases. Old Codex profile files are not read by scene
-launches. Old personal `codex.team`, `codex.budget`, `codex.expert` and
-`codex.solo` overrides must be migrated to `codex.scenes`.
-
-For Codex and Trae, the terminal picker follows Agent → Scene → Single / Team.
-Claude and OpenCode skip the scene step. `--tmux` uses interactive pane workers
-for Team. Explicit legacy non-Codex budget commands remain available, including
-`traex-budget` for a single TraeX session.
+Trae retains its daily, hard and batch scenes. `--adjust quick` is a Trae-only
+option and selects Astra low. Trae model/effort settings are checked against
+`traex debug models` when requested. CodexRadar recommendations can be checked
+with `agent-team recommendations status` or refreshed manually with
+`agent-team recommendations refresh`.
 
 Team defaults to YOLO; `--no-yolo` inherits CLI permissions for the entire team.
 Single inherits CLI permissions unless the caller explicitly opts in. Existing
@@ -174,10 +162,12 @@ and delegation rules are independent of model choices. Other tools have no
 assumed budget model: configure a distinct budget combination when desired.
 There is no automatic budget switching.
 
-Machine-local scene overrides belong in `codex.scenes.<scene>` in
-`$XDG_CONFIG_HOME/agent-team/config.json`. Daily, hard and computer use the same
-model and effort for Single and lead. Batch adds `lead_model` and `lead_effort`. Team
-adds `worker_model`, `worker_effort` and `limit`; `fast` is scene-wide.
+Codex recommendation choices come from CodexRadar and are cached locally; the
+launcher does not define a built-in Codex scene catalog. If recommendations are
+unavailable, Codex starts with its native model and reasoning defaults. Fast is
+never taken from a recommendation and is only enabled with an explicit `--fast`.
+Trae scene overrides remain available under `traex.scenes.<scene>` in
+`$XDG_CONFIG_HOME/agent-team/config.json`.
 
 The controller injects [shared team rules](config/team-rules.md) into each supported tool, including
 TraeX. Existing tool configuration/auth remains in place. Codex/TraeX team mode

@@ -1,0 +1,7 @@
+{
+  "url": "https://codexradar.com/api/radar-insights",
+  "html_fallback_url": "https://codexradar.com/",
+  "menu_category_limit": 4,
+  "refresh_interval_seconds": 86400,
+  "failure_retry_interval_seconds": 300
+}

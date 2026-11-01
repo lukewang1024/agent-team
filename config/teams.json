@@ -1,43 +1,7 @@
 {
   "codex": {
-    "scenes": {
-      "daily": {
-        "model": "gpt-6.1-sol",
-        "effort": "max",
-        "fast": true,
-        "worker_model": "gpt-6.1-sol",
-        "worker_effort": "max"
-      },
-      "hard": {
-        "model": "gpt-6-astra",
-        "effort": "xhigh",
-        "fast": false,
-        "worker_model": "gpt-6.1-sol",
-        "worker_effort": "max"
-      },
-      "batch": {
-        "model": "gpt-6-luna",
-        "effort": "max",
-        "fast": false,
-        "lead_model": "gpt-6.1-sol",
-        "lead_effort": "high",
-        "worker_model": "gpt-6-luna",
-        "worker_effort": "max"
-      },
-      "computer": {
-        "model": "gpt-6.1-terra",
-        "effort": "max",
-        "fast": false,
-        "worker_model": "gpt-6.1-terra",
-        "worker_effort": "max"
-      }
-    },
-    "adjustments": {
-      "quick": {
-        "model": "gpt-6-astra",
-        "effort": "low"
-      }
-    }
+    "scenes": {},
+    "adjustments": {}
   },
   "traex": {
     "team": {},
