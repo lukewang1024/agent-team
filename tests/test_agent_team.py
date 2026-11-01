@@ -71,22 +71,38 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '--tmux requires --team'):
             TEAM.start_simple(['--tmux'], 'claude')
 
-    def test_single_scene_plans_use_explicit_model_effort_and_speed(self):
-        expected = {'daily': ('gpt-6.1-sol', 'max', True),
-                    'hard': ('gpt-6-astra', 'xhigh', False),
-                    'batch': ('gpt-6-luna', 'max', False),
-                    'computer': ('gpt-6.1-terra', 'max', False)}
-        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'XDG_CONFIG_HOME': directory}):
-            for scene, (model, effort, fast) in expected.items():
-                with contextlib.redirect_stdout(io.StringIO()) as output:
-                    TEAM.start_codex(['--scene', scene, '--dry-run', 'resume', 'thread'])
+    def test_codex_without_a_selected_recommendation_uses_native_defaults(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {'XDG_CONFIG_HOME': directory}), \
+                patch.object(TEAM, 'CODEX_RADAR_RUNTIME', False), \
+                patch.object(TEAM, 'CODEX_RADAR_MENU_CACHE', None):
+            for team in (False, True):
+                flags = ['--dry-run'] + (['--team'] if team else [])
+                with contextlib.redirect_stdout(io.StringIO()) as output, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    TEAM.start_codex(flags)
                 plan = json.loads(output.getvalue())
-                self.assertEqual((plan['config']['model'], plan['config']['effort'], plan['config']['fast']),
-                                 (model, effort, fast))
-                self.assertIn('agents.enabled=false', plan['argv'])
-                self.assertIn('service_tier=' + json.dumps('fast' if fast else 'default'), plan['argv'])
-                self.assertEqual(plan['argv'][-2:], ['resume', 'thread'])
+                self.assertIsNone(plan['config']['recommendation_id'])
+                self.assertEqual(plan['config']['fast'], False)
+                self.assertNotIn('model', plan['config'])
+                self.assertNotIn('effort', plan['config'])
+                self.assertNotIn('-m', plan['argv'])
+                self.assertFalse(any('model_reasoning_effort=' in arg for arg in plan['argv']))
+                self.assertFalse(any('service_tier=' in arg for arg in plan['argv']))
 
+    def test_fast_service_tier_is_only_sent_when_explicit(self):
+        for flags, expected in [([], None), (['--fast'], 'fast'), (['--no-fast'], 'default')]:
+            with self.subTest(flags=flags), contextlib.redirect_stdout(io.StringIO()) as output, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                TEAM.start_codex(['--dry-run'] + flags)
+            plan = json.loads(output.getvalue())
+            tiers = [arg.split('=', 1)[1] for arg in plan['argv'] if arg.startswith('service_tier=')]
+            self.assertEqual(tiers, [json.dumps(expected)] if expected else [])
+
+        args, _ = TEAM.command('codex', {'limit': 2, 'fast': False}, 'native')
+        self.assertFalse(any('service_tier=' in arg for arg in args))
+        args, _ = TEAM.command('codex', {'limit': 2, 'fast': True, 'fast_explicit': True}, 'native')
+        self.assertIn('service_tier="fast"', args)
     def test_trae_catalog_checks_aliases_effort_and_missing_models(self):
         cfg = TEAM.scene_settings('hard', team=True, tool='traex')
         catalog = {'models': [dict(slug=name.upper(), config_name=name,
@@ -139,28 +155,32 @@ class AdapterTests(unittest.TestCase):
             TEAM.start_codex(['--dry-run', '--approve-for-me', '--', '--dry-run'])
         self.assertEqual(json.loads(output.getvalue())['argv'][-3:], ['--approve-for-me', '--', '--dry-run'])
 
-    def test_team_scenes_share_worker_policy_and_speed_in_both_modes(self):
-        expected = {'daily': ('gpt-6.1-sol', 'max', 'gpt-6.1-sol', 'max', True),
-                    'hard': ('gpt-6-astra', 'xhigh', 'gpt-6.1-sol', 'max', False),
-                    'batch': ('gpt-6.1-sol', 'high', 'gpt-6-luna', 'max', False),
-                    'computer': ('gpt-6.1-terra', 'max', 'gpt-6.1-terra', 'max', False)}
-        for scene, wanted in expected.items():
-            cfg = TEAM.scene_settings(scene, team=True)
-            self.assertEqual(tuple(cfg[k] for k in ('model','effort','worker_model','worker_effort','fast')), wanted)
-            for mode in ('native', 'tmux'):
-                for worker in (False, True):
-                    args, _ = TEAM.command('codex', cfg, mode, worker=worker)
-                    self.assertNotIn('--profile', args)
-                    self.assertIn('service_tier=' + json.dumps('fast' if wanted[-1] else 'default'), args)
-                    self.assertIn(wanted[2] if worker else wanted[0], args)
-
-    def test_obsolete_personal_presets_fail_instead_of_silently_falling_back(self):
+    def test_codex_team_without_recommendation_uses_native_defaults_for_all_roles(self):
+        cfg = TEAM.codex_settings(team=True, cache={
+            'source_url': TEAM.codex_radar_options()['url'],
+            'recommendations': {'items': []},
+        })
+        self.assertFalse(cfg['fast'])
+        self.assertNotIn('model', cfg)
+        self.assertNotIn('worker_model', cfg)
+        for mode in ('native', 'tmux'):
+            for worker in (False, True):
+                args, _ = TEAM.command('codex', cfg, mode, worker=worker)
+                self.assertFalse(any('service_tier=' in arg for arg in args))
+                self.assertNotIn('-m', args)
+                self.assertFalse(any('model_reasoning_effort=' in arg for arg in args))
+    def test_codex_does_not_use_old_local_scene_tiers_as_a_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory) / 'agent-team'; folder.mkdir()
-            (folder / 'config.json').write_text('{"codex":{"expert":{"worker_effort":"max"}}}')
-            with patch.dict(os.environ, {'XDG_CONFIG_HOME': directory}), self.assertRaisesRegex(RuntimeError, 'Migrate'):
-                TEAM.scene_settings('hard', True)
-
+            (folder / 'config.json').write_text(json.dumps({
+                'codex': {'scenes': {'daily': {'model': 'old-model', 'effort': 'max'}}}
+            }))
+            with patch.dict(os.environ, {'XDG_CONFIG_HOME': directory}), \
+                    patch.object(TEAM, 'CODEX_RADAR_RUNTIME', False):
+                cfg = TEAM.codex_settings('daily', team=True)
+            self.assertFalse(cfg['fast'])
+            self.assertNotIn('model', cfg)
+            self.assertNotIn('effort', cfg)
     def test_budget_prompt_matches_custom_resolved_settings(self):
         cfg = {'model': 'lead-model', 'worker_model': 'budget-worker',
                'worker_effort': 'high', 'limit': 2}
@@ -226,23 +246,37 @@ class AdapterTests(unittest.TestCase):
             TEAM.main()
         launch.assert_called_once_with(['--team', '--tmux'], tool='claude')
 
-    def test_picker_selects_codex_scene_then_mode(self):
-        for tool, choice, scene, mode in [('codex', '2', 'hard', '2'),
-                                         ('codex', '4', 'computer', '1'),
-                                         ('codex', '4', 'computer', '2'),
-                                         ('traex', '3', 'batch', '1')]:
-            with self.subTest(tool=tool, scene=scene, mode=mode), \
-                    patch.object(TEAM.sys, 'argv', ['agent-team']), \
-                    patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \
-                    patch.object(TEAM.shutil, 'which', side_effect=lambda name: '/bin/tool' if name == tool else None), \
-                    patch('builtins.input', side_effect=['1', choice, mode]) as ask, \
-                    patch.object(TEAM, 'start_codex') as launch, \
-                    contextlib.redirect_stdout(io.StringIO()):
-                TEAM.main()
-            flags = ['--scene', scene] + (['--team'] if mode == '2' else [])
-            launch.assert_called_once_with(flags, tool=tool)
-            self.assertEqual('电脑自动化' in ask.call_args_list[1].args[0], tool == 'codex')
+    def test_picker_uses_available_codex_recommendations_without_default_option(self):
+        url = TEAM.codex_radar_options()['url']
+        cache = {
+            'version': 2,
+            'source_url': url,
+            'fetched_at': time.time(),
+            'recommendations': {'items': [
+                {'id': 'blue-team-1234567890', 'source_key': 'blue_team',
+                 'label': '蓝队任务 · GPT-5.6 Sol xhigh', 'model': 'gpt-5.6-sol', 'effort': 'xhigh'}
+            ]},
+        }
+        with patch.object(TEAM.sys, 'argv', ['agent-team']), \
+                patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \
+                patch.object(TEAM.shutil, 'which', side_effect=lambda name: '/bin/tool' if name == 'codex' else None), \
+                patch('builtins.input', side_effect=['1', '1', '2']), \
+                patch.object(TEAM, 'prepare_codex_radar_for_menu', return_value=cache), \
+                patch.object(TEAM, 'start_codex') as launch, \
+                contextlib.redirect_stdout(io.StringIO()):
+            TEAM.main()
+        launch.assert_called_once_with(
+            ['--recommendation', 'blue-team-1234567890', '--team'], tool='codex')
 
+    def test_picker_keeps_trae_scene_selection(self):
+        with patch.object(TEAM.sys, 'argv', ['agent-team']), \
+                patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \
+                patch.object(TEAM.shutil, 'which', side_effect=lambda name: '/bin/tool' if name == 'traex' else None), \
+                patch('builtins.input', side_effect=['1', '3', '1']), \
+                patch.object(TEAM, 'start_codex') as launch, \
+                contextlib.redirect_stdout(io.StringIO()):
+            TEAM.main()
+        launch.assert_called_once_with(['--scene', 'batch'], tool='traex')
     def test_computer_scene_is_not_available_to_trae(self):
         with self.assertRaisesRegex(RuntimeError, 'Unknown traex scene: computer'):
             TEAM.scene_settings('computer', tool='traex')
@@ -251,27 +285,38 @@ class AdapterTests(unittest.TestCase):
                 TEAM.start_codex(['--scene', 'computer', '--dry-run'], tool='traex')
             execute.assert_not_called()
 
-    def test_removed_presets_and_quick_adjustment(self):
+    def test_removed_codex_presets_and_dynamic_recommendation_selector(self):
         for flags in (['--team-expert'], ['--team-budget']):
             with self.assertRaisesRegex(RuntimeError, 'removed'):
                 TEAM.launch('codex', flags + ['--team-dry-run'])
-        cfg = TEAM.scene_settings('daily', True, 'quick')
-        self.assertEqual((cfg['model'], cfg['effort'], cfg['worker_model'], cfg['fast']),
-                         ('gpt-6-astra', 'low', 'gpt-6.1-sol', True))
-
-    def test_check_validates_scene_without_launching_an_agent(self):
-        with patch.object(TEAM, 'validate_scene_models') as validate, \
+        cfg = TEAM.codex_settings('unknown-recommendation', team=True, cache={
+            'source_url': TEAM.codex_radar_options()['url'],
+            'recommendations': {'items': []},
+        })
+        self.assertNotIn('model', cfg)
+        self.assertFalse(cfg['fast'])
+        quick = TEAM.scene_settings('daily', True, 'quick', tool='traex')
+        self.assertEqual((quick['model'], quick['effort']), ('gpt-6-astra', 'low'))
+    def test_check_without_available_recommendation_still_uses_codex_defaults(self):
+        with patch.object(TEAM, 'CODEX_RADAR_RUNTIME', False), \
+                patch.object(TEAM, 'CODEX_RADAR_MENU_CACHE', None), \
+                patch.object(TEAM, 'validate_scene_models') as validate, \
                 patch.object(TEAM.os, 'execvpe') as execute, \
                 contextlib.redirect_stdout(io.StringIO()) as output:
-            TEAM.start_codex(['--scene', 'hard', '--team', '--check'])
+            TEAM.start_codex(['--recommendation', 'missing-rec', '--team', '--check'])
         validate.assert_called_once()
         self.assertTrue(validate.call_args.args[1])
-        self.assertEqual(json.loads(output.getvalue())['config']['scene'], 'hard')
+        plan = json.loads(output.getvalue())
+        self.assertIsNone(plan['config']['recommendation_id'])
+        self.assertNotIn('model', plan['config'])
         execute.assert_not_called()
-
     def test_model_catalog_rejects_unavailable_models_efforts_and_fast(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'CODEX_HOME': directory}):
             cfg = TEAM.scene_settings('daily', True)
+            # Missing optional tiers use Codex defaults and do not require its model catalog.
+            TEAM.validate_scene_models(cfg, True)
+            cfg = dict(cfg, model='gpt-6.1-sol', effort='max',
+                       worker_model='gpt-6.1-sol', worker_effort='max', fast=True)
             with self.assertRaisesRegex(RuntimeError, 'catalog is unavailable'):
                 TEAM.validate_scene_models(cfg, True)
             path = Path(directory) / 'models_cache.json'
@@ -300,24 +345,209 @@ class AdapterTests(unittest.TestCase):
                 for team in (False, True):
                     with self.subTest(cache=cache, team=team), \
                             patch.object(TEAM.shutil, 'which', return_value='/bin/codex'), \
-                            patch.object(TEAM.os, 'execvpe') as execute:
+                            patch.object(TEAM.os, 'execvpe') as execute, \
+                            contextlib.redirect_stderr(io.StringIO()):
                         TEAM.start_codex(['--team'] if team else ['--yolo'])
                     args = execute.call_args.args[1]
-                    self.assertEqual(args[args.index('-m') + 1], 'gpt-6.1-sol')
-                    self.assertIn('model_reasoning_effort="max"', args)
-                    self.assertIn('service_tier="fast"', args)
+                    self.assertNotIn('-m', args)
+                    self.assertFalse(any('model_reasoning_effort=' in arg for arg in args))
+                    self.assertFalse(any('service_tier=' in arg for arg in args))
                     self.assertTrue('--yolo' in args or '--dangerously-bypass-approvals-and-sandbox' in args)
 
-    def test_check_still_reports_missing_model_without_launching_codex(self):
+    def test_check_uses_codex_defaults_without_a_model_catalog(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
                 'CODEX_HOME': directory, 'XDG_CONFIG_HOME': directory}):
-            (Path(directory) / 'models_cache.json').write_text('{"models": []}')
             for team in (False, True):
-                with self.subTest(team=team), patch.object(TEAM.os, 'execvpe') as execute:
-                    with self.assertRaisesRegex(RuntimeError, 'no fallback'):
-                        TEAM.start_codex(['--check'] + (['--team'] if team else []))
+                with self.subTest(team=team), patch.object(TEAM.os, 'execvpe') as execute, \
+                        contextlib.redirect_stdout(io.StringIO()) as output, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    TEAM.start_codex(['--check'] + (['--team'] if team else []))
                     execute.assert_not_called()
+                    plan = json.loads(output.getvalue())
+                    self.assertNotIn('-m', plan['argv'])
+                    self.assertFalse(any('model_reasoning_effort=' in arg for arg in plan['argv']))
 
+    def test_missing_codex_teams_file_uses_native_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_dir = Path(directory) / 'missing-config'
+            config_dir.mkdir()
+            for name in ('team-rules.md', 'team-pane.md'):
+                shutil.copy2(ROOT / 'config' / name, config_dir / name)
+            with patch.object(TEAM, 'CONFIG', config_dir), patch.dict(os.environ, {
+                    'CODEX_HOME': directory, 'XDG_CONFIG_HOME': str(Path(directory) / 'xdg')}):
+                cfg = TEAM.scene_settings('daily', team=True)
+                self.assertFalse(cfg['fast'])
+                self.assertNotIn('model', cfg)
+                self.assertNotIn('effort', cfg)
+                with contextlib.redirect_stdout(io.StringIO()) as output, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    TEAM.start_codex(['--scene', 'daily', '--team', '--check'])
+                plan = json.loads(output.getvalue())
+                self.assertNotIn('-m', plan['argv'])
+                self.assertFalse(any('model_reasoning_effort=' in arg for arg in plan['argv']))
+
+    def test_codex_radar_payload_keeps_dynamic_categories_and_all_model_choices(self):
+        options = TEAM.codex_radar_options()
+        payload = {
+            'schema': 1,
+            'updated_at': '2026-11-01T00:00:00Z',
+            'recommendations': [
+                {'scene': 'daily_development', 'title': '日常开发', 'items': [
+                    {'model': 'GPT-6.1 Sol', 'effort': 'High', 'fast': True},
+                ]},
+                {'category': 'background_automation', 'title': '后台自动化', 'items': [
+                    {'model': 'GPT-5.6 Luna', 'reasoning_effort': 'Max'},
+                    {'model': 'GPT-6 Luna', 'reasoning_effort': 'Max'},
+                ]},
+                {'key': 'blue_team', 'label': '蓝队任务',
+                 'model': 'GPT-5.6 Sol', 'reasoning_effort': 'X High'},
+            ],
+            'alerts': [],
+        }
+        normalized = TEAM.normalize_codex_radar(payload, options)
+        items = normalized['items']
+        self.assertEqual(len(items), 4)
+        self.assertEqual(items[0]['model'], 'gpt-6.1-sol')
+        self.assertEqual(items[0]['effort'], 'high')
+        self.assertEqual(items[1]['model'], 'gpt-5.6-luna')
+        self.assertEqual(items[2]['model'], 'gpt-6-luna')
+        self.assertEqual(items[3]['effort'], 'xhigh')
+        self.assertEqual(len({item['id'] for item in items}), 4)
+        self.assertTrue(all('fast' not in item for item in items))
+        self.assertEqual(TEAM.normalize_codex_radar(
+            {'schema': 1, 'recommendations': [], 'alerts': []}, options), {'items': []})
+        with self.assertRaisesRegex(RuntimeError, 'unsupported.*schema'):
+            TEAM.normalize_codex_radar({'schema': 2, 'recommendations': []}, options)
+
+        cache = {'source_url': options['url'], 'recommendations': normalized}
+        selected = TEAM.codex_settings(items[2]['id'], team=True, cache=cache)
+        self.assertEqual(selected['model'], 'gpt-6-luna')
+        self.assertEqual(selected['worker_model'], 'gpt-6-luna')
+        self.assertEqual(selected['worker_effort'], 'max')
+        self.assertFalse(selected['fast'])
+        fallback = TEAM.codex_settings('absent-id', team=True, cache=cache)
+        self.assertNotIn('model', fallback)
+        self.assertNotIn('worker_model', fallback)
+    def test_codex_radar_refresh_fetches_and_caches_dynamic_recommendations(self):
+        payload = {
+            'schema': 1,
+            'updated_at': '2026-11-01T00:00:00Z',
+            'recommendations': [{
+                'scene': 'daily_development', 'title': '日常开发',
+                'items': [{'model': 'GPT-6.1 Sol', 'effort': 'High', 'fast': True}],
+            }],
+            'alerts': [],
+        }
+
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self, _limit): return json.dumps(payload).encode()
+
+        class Opener:
+            def __init__(self): self.request = None
+            def open(self, request, timeout):
+                self.request = request
+                self.timeout = timeout
+                return Response()
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                'XDG_CACHE_HOME': directory, 'XDG_CONFIG_HOME': str(Path(directory) / 'config')}):
+            opener = Opener()
+            with patch.object(TEAM.urllib.request, 'build_opener', return_value=opener):
+                cache, updated = TEAM.update_codex_radar_recommendations(force=True)
+            self.assertTrue(updated)
+            self.assertEqual(opener.request.full_url, 'https://codexradar.com/api/radar-insights')
+            self.assertEqual(opener.request.get_header('Origin'), 'https://codexradar.com')
+            self.assertEqual(cache['version'], 2)
+            item = cache['recommendations']['items'][0]
+            self.assertEqual(item['model'], 'gpt-6.1-sol')
+            self.assertEqual(item['effort'], 'high')
+            self.assertNotIn('fast', item)
+            saved = TEAM.read_codex_radar_cache()
+            self.assertEqual(saved['recommendations']['items'][0]['effort'], 'high')
+
+    def test_legacy_scene_cache_migrates_to_empty_remote_recommendations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'old-cache.json'
+            TEAM.write(path, {
+                'version': 1,
+                'source_url': TEAM.codex_radar_options()['url'],
+                'last_attempt_at': 123,
+                'last_error': 'HTTPError:404',
+                'scenes': {'daily': {'model': 'stale-model', 'effort': 'max'}},
+            })
+            cache = TEAM.read_codex_radar_cache(path)
+        self.assertEqual(cache['version'], 2)
+        self.assertEqual(cache['recommendations'], {'items': []})
+        self.assertNotIn('scenes', cache)
+        self.assertEqual(cache['last_error'], 'HTTPError:404')
+
+    def test_recommendation_status_identifies_endpoint_for_cached_error(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                'XDG_CACHE_HOME': directory, 'XDG_CONFIG_HOME': str(Path(directory) / 'config')}):
+            endpoint = TEAM.codex_radar_options()['url']
+            cache = {
+                'version': 2, 'source_url': endpoint, 'last_attempt_url': endpoint,
+                'last_error': 'HTTPError:404', 'recommendations': {'items': []},
+            }
+            TEAM.codex_radar_cache_path().parent.mkdir(parents=True)
+            TEAM.write(TEAM.codex_radar_cache_path(), cache)
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                TEAM.codex_radar_command(['status'])
+        status = json.loads(output.getvalue())
+        self.assertEqual(status['last_error'], 'HTTPError:404')
+        self.assertEqual(status['last_error_endpoint'], endpoint)
+    def test_codex_radar_refresh_is_staged_and_empty_cache_retries_quickly(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                'XDG_CACHE_HOME': directory, 'XDG_CONFIG_HOME': str(Path(directory) / 'config')}):
+            url = TEAM.codex_radar_options()['url']
+            old = {
+                'version': 2,
+                'source_url': url,
+                'fetched_at': time.time() - 86401,
+                'last_attempt_at': time.time() - 86401,
+                'recommendations': {'items': [{
+                    'id': 'daily-1111111111', 'source_key': 'daily_development',
+                    'label': '日常开发 · old-model max', 'model': 'old-model', 'effort': 'max'
+                }]},
+            }
+            TEAM.codex_radar_cache_path().parent.mkdir(parents=True)
+            TEAM.write(TEAM.codex_radar_cache_path(), old)
+            with patch.object(TEAM, 'start_codex_radar_background_refresh', return_value=True) as start, \
+                    patch.object(TEAM, 'update_codex_radar_recommendations') as update:
+                active = TEAM.prepare_codex_radar_for_menu()
+                start.assert_called_once()
+                update.assert_not_called()
+            self.assertEqual(active['recommendations']['items'][0]['model'], 'old-model')
+
+            new = {
+                'version': 2,
+                'source_url': url,
+                'fetched_at': time.time(),
+                'last_attempt_at': time.time(),
+                'recommendations': {'items': [{
+                    'id': 'daily-2222222222', 'source_key': 'daily_development',
+                    'label': '日常开发 · new-model high', 'model': 'new-model', 'effort': 'high'
+                }]},
+            }
+            TEAM.write(TEAM.codex_radar_pending_cache_path(), new)
+            active = TEAM.prepare_codex_radar_for_menu()
+            self.assertEqual(active['recommendations']['items'][0]['model'], 'new-model')
+            self.assertFalse(TEAM.codex_radar_pending_cache_path().exists())
+
+            failed = {
+                'version': 2,
+                'source_url': url,
+                'last_attempt_at': time.time() - 301,
+                'recommendations': {'items': []},
+                'last_error': 'HTTPError:404 GET https://codexradar.com/api/radar-insights',
+            }
+            TEAM.write(TEAM.codex_radar_cache_path(), failed)
+            with patch.object(TEAM, 'update_codex_radar_recommendations', return_value=(new, True)) as update:
+                active = TEAM.prepare_codex_radar_for_menu()
+            update.assert_called_once_with(force=True)
+            self.assertEqual(active['recommendations']['items'][0]['model'], 'new-model')
     def test_trae_launches_still_validate_live_catalog_before_exec(self):
         for team in (False, True):
             with self.subTest(team=team), \
@@ -426,7 +656,9 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(env['CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR'], '0')
 
     def test_prompt_after_separator_is_not_a_wrapper_flag(self):
-        with patch.object(TEAM, 'settings', return_value={'limit': 2}), patch.object(TEAM.os, 'execvpe') as execute:
+        with patch.object(TEAM, 'settings', return_value={'limit': 2}), \
+                patch.object(TEAM.shutil, 'which', return_value='/bin/claude'), \
+                patch.object(TEAM.os, 'execvpe') as execute:
             TEAM.launch('claude', ['--', '--tmux'])
         self.assertEqual(execute.call_args.args[1][-2:], ['--', '--tmux'])
 
@@ -487,7 +719,7 @@ class PaneTests(unittest.TestCase):
         self.wait_for(lambda: 'interactive-ready' in self.capture(name))
         return json.loads(result)
 
-    def test_codex_scene_worker_uses_scene_model_and_shared_fast_in_real_panes(self):
+    def test_codex_team_worker_uses_native_defaults_when_recommendations_are_missing(self):
         codex_home = self.root / 'codex-home'; codex_home.mkdir()
         (codex_home / 'models_cache.json').write_text(json.dumps({'models':[
             {'slug':model, 'supported_reasoning_levels':[{'effort':effort} for effort in ['high','max','xhigh']], 'additional_speed_tiers':['fast']}
@@ -496,23 +728,22 @@ class PaneTests(unittest.TestCase):
         fake.write_text('#!' + os.sys.executable + '\nimport json,os,sys\nfrom pathlib import Path\nPath(os.environ["AGENT_TEAM_DIR"], os.environ["AGENT_TEAM_ROLE"]+"-argv.json").write_text(json.dumps(sys.argv[1:]))\nprint("interactive-ready",flush=True)\nfor line in sys.stdin: pass\n')
         fake.chmod(0o755)
         self.env['CODEX_HOME'] = str(codex_home)
-        for scene, roles in [('batch', [('lead','gpt-6.1-sol','high'), ('worker_a','gpt-6-luna','max')]),
-                             ('computer', [('lead','gpt-6.1-terra','max'), ('worker_a','gpt-6.1-terra','max')])]:
-            with self.subTest(scene=scene):
-                previous = set((self.root / 'state/agent-team').iterdir())
-                with patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(io.StringIO()):
-                    TEAM.start_codex(['--scene',scene,'--team','--tmux'])
-                self.directory = next(path for path in (self.root / 'state/agent-team').iterdir() if path not in previous)
-                self.env['AGENT_TEAM_DIR'] = str(self.directory)
-                self.wait_for(lambda: 'interactive-ready' in self.capture('lead'))
-                self.spawn('worker_a')
-                for role, model, effort in roles:
-                    args = json.loads((self.directory / (role+'-argv.json')).read_text())
-                    self.assertIn(model, args)
-                    self.assertIn('model_reasoning_effort=' + json.dumps(effort), args)
-                    self.assertIn('service_tier="default"', args)
-                self.assertEqual(self.state()['config']['scene'], scene)
-
+        previous = set((self.root / 'state/agent-team').iterdir())
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch.object(TEAM, 'CODEX_RADAR_RUNTIME', False), \
+                patch.object(TEAM, 'CODEX_RADAR_MENU_CACHE', None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            TEAM.start_codex(['--team','--tmux'])
+        self.directory = next(path for path in (self.root / 'state/agent-team').iterdir() if path not in previous)
+        self.env['AGENT_TEAM_DIR'] = str(self.directory)
+        self.wait_for(lambda: 'interactive-ready' in self.capture('lead'))
+        self.spawn('worker_a')
+        for role in ('lead', 'worker_a'):
+            args = json.loads((self.directory / (role+'-argv.json')).read_text())
+            self.assertNotIn('-m', args)
+            self.assertFalse(any('model_reasoning_effort=' in arg for arg in args))
+            self.assertFalse(any('service_tier=' in arg for arg in args))
+        self.assertIsNone(self.state()['config']['recommendation_id'])
     def test_interactive_layout_cap_mailbox_reuse_and_stop(self):
         self.spawn('one')
         self.spawn('two')

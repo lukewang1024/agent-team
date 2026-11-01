@@ -3,6 +3,8 @@
 import argparse
 import contextlib
 import hashlib
+import http.client
+from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
@@ -12,12 +14,17 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "config"
 TOOLS = ("codex", "traex", "opencode", "claude")
 TEAM_BORDER_FORMAT = " #{?@agent_team_role,#{@agent_team_role} | ,}#{pane_title} "
+CODEX_RADAR_MENU_CACHE = None
+CODEX_RADAR_RUNTIME = False
 
 
 def fail(message):
@@ -30,7 +37,7 @@ def read(path):
 
 def write(path, value):
     path = Path(path)
-    temp = path.with_name(path.name + ".tmp")
+    temp = path.with_name(path.name + "." + str(os.getpid()) + "." + uuid.uuid4().hex + ".tmp")
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
     temp.chmod(0o600)
     temp.replace(path)
@@ -45,24 +52,662 @@ def merge(base, extra):
     return base
 
 
-SCENE_LABELS = {"daily": "日常开发", "hard": "复杂攻坚", "batch": "批量执行", "computer": "电脑自动化"}
+def codex_radar_options():
+    options = read(CONFIG / "codexradar.json")
+    if not isinstance(options, dict):
+        fail("Codex Radar settings must be an object")
+    user_config = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-team/config.json"
+    if user_config.exists():
+        user_settings = read(user_config)
+        if not isinstance(user_settings, dict):
+            fail("User configuration must be an object in " + str(user_config))
+        personal = user_settings.get("codex_radar", {})
+        if not isinstance(personal, dict):
+            fail("codex_radar settings must be an object in " + str(user_config))
+        merge(options, personal)
+    url = options.get("url")
+    if not isinstance(url, str) or not url.startswith("https://"):
+        fail("Codex Radar URL must use HTTPS")
+    html_fallback_url = options.get("html_fallback_url")
+    if html_fallback_url is not None and (
+            not isinstance(html_fallback_url, str) or not html_fallback_url.startswith("https://")):
+        fail("Codex Radar html_fallback_url must use HTTPS")
+    interval = options.get("refresh_interval_seconds", 86400)
+    if type(interval) not in (int, float) or interval < 60:
+        fail("Codex Radar refresh_interval_seconds must be at least 60")
+    failure_interval = options.get("failure_retry_interval_seconds", 300)
+    if type(failure_interval) not in (int, float) or failure_interval < 60:
+        fail("Codex Radar failure_retry_interval_seconds must be at least 60")
+    menu_category_limit = options.get("menu_category_limit", 4)
+    if type(menu_category_limit) is not int or menu_category_limit < 1:
+        fail("Codex Radar menu_category_limit must be a positive integer")
+    return options
+
+
+def codex_radar_cache_path():
+    cache_home = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+    return cache_home / "agent-team" / "codexradar-recommendations.json"
+
+
+def codex_radar_pending_cache_path():
+    return codex_radar_cache_path().with_name("codexradar-recommendations.pending.json")
+
+
+def codex_radar_url_label(url):
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname or "unknown-host"
+    if parsed.port:
+        host += ":" + str(parsed.port)
+    return urllib.parse.urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+
+
+def normalize_codex_radar(data, options):
+    if not isinstance(data, dict) or data.get("ok") is False:
+        fail("Codex Radar returned an invalid recommendations document")
+    if "schema" in data and data["schema"] != 1:
+        fail("Codex Radar returned an unsupported recommendations schema")
+    recommendations = data.get("recommendations")
+    if not isinstance(recommendations, list):
+        fail("Codex Radar response has no recommendations list")
+
+    normalized = {"items": []}
+    for record_index, recommendation in enumerate(recommendations):
+        if not isinstance(recommendation, dict):
+            continue
+        source_key = next((recommendation[key].strip() for key in
+                           ("key", "scene", "scene_key", "category", "id", "slug")
+                           if isinstance(recommendation.get(key), str) and recommendation[key].strip()), None)
+        source_label = next((recommendation[key].strip() for key in
+                             ("title", "name", "label", "display_name", "scene_name", "category_name")
+                             if isinstance(recommendation.get(key), str) and recommendation[key].strip()), None)
+        source_key = source_key or source_label or ("recommendation-" + str(record_index + 1))
+        source_label = source_label or re.sub(r"[_-]+", " ", source_key).strip()
+        source_label = "".join(character for character in source_label
+                               if character.isprintable() and character != "#").strip()[:80]
+        if not source_label:
+            source_label = "CodexRadar recommendation " + str(record_index + 1)
+        items = recommendation.get("items")
+        if isinstance(items, list):
+            candidates = items
+        elif isinstance(items, dict):
+            candidates = [items]
+        else:
+            candidate = recommendation.get("recommendation", recommendation)
+            candidates = candidate if isinstance(candidate, list) else [candidate]
+        source_id = re.sub(r"[^A-Za-z0-9._-]+", "-", source_key.lower()).strip("-._")[:64]
+        if not source_id:
+            source_id = "recommendation-" + hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:12]
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            model = item.get("model", item.get("model_id"))
+            effort = item.get("effort", item.get("reasoning_effort", item.get("reasoning_level")))
+            if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,63}", model.strip()):
+                continue
+            if not isinstance(effort, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_ -]{0,23}", effort.strip()):
+                continue
+            raw_model = model.strip()
+            raw_effort = effort.strip()
+            model_id = re.sub(r"\s+", "-", raw_model.lower())
+            effort_id = re.sub(r"[\s_-]+", "", raw_effort.lower())
+            stable_suffix = hashlib.sha256((source_key + "\0" + model_id + "\0" + effort_id).encode("utf-8")).hexdigest()[:10]
+            normalized["items"].append({
+                "id": source_id + "-" + stable_suffix,
+                "source_key": source_key,
+                "label": source_label + " · " + raw_model + " " + raw_effort,
+                "model": model_id,
+                "effort": effort_id,
+            })
+    if recommendations and not normalized["items"]:
+        fail("Codex Radar response contains no usable model/effort recommendations")
+    return normalized
+
+
+class CodexRadarHTMLParser(HTMLParser):
+    BLOCK_TAGS = {
+        "article", "aside", "blockquote", "br", "dd", "div", "dl", "dt",
+        "figcaption", "figure", "footer", "form", "header", "li", "main",
+        "nav", "ol", "p", "section", "table", "td", "th", "tr", "ul",
+    }
+    INLINE_TAGS = {"b", "code", "em", "i", "span", "strong"}
+    SKIP_TAGS = {"script", "style", "noscript", "template"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.events = []
+        self.text = []
+        self.heading = None
+        self.skipping = None
+
+    def flush_text(self):
+        value = "".join(self.text)
+        if value.strip():
+            self.events.append(("text", value))
+        self.text = []
+
+    def handle_starttag(self, tag, attrs):
+        if self.skipping:
+            return
+        if tag in self.SKIP_TAGS:
+            self.flush_text()
+            self.skipping = tag
+            return
+        if len(tag) == 2 and tag[0] == "h" and tag[1] in "123456":
+            self.flush_text()
+            self.heading = (int(tag[1]), [])
+            return
+        if tag in self.BLOCK_TAGS:
+            target = self.heading[1] if self.heading else self.text
+            target.append("\n")
+        elif tag in self.INLINE_TAGS:
+            target = self.heading[1] if self.heading else self.text
+            target.append(" ")
+
+    def handle_endtag(self, tag):
+        if self.skipping:
+            if tag == self.skipping:
+                self.skipping = None
+            return
+        if self.heading and len(tag) == 2 and tag[0] == "h" and tag[1] in "123456":
+            level, parts = self.heading
+            label = re.sub(r"\s+", " ", "".join(parts)).strip()
+            self.events.append(("heading", level, label))
+            self.heading = None
+        elif tag in self.BLOCK_TAGS:
+            self.text.append("\n")
+        elif tag in self.INLINE_TAGS:
+            self.text.append(" ")
+
+    def handle_data(self, data):
+        if self.skipping:
+            return
+        target = self.heading[1] if self.heading else self.text
+        target.append(data)
+
+
+def normalize_codex_radar_html(document, options):
+    parser = CodexRadarHTMLParser()
+    parser.feed(document)
+    parser.close()
+
+    section_level = None
+    scene_level = None
+    scenes = []
+    current_scene = None
+    in_section = False
+    for event in parser.events:
+        if event[0] == "heading":
+            _, level, label = event
+            compact_label = re.sub(r"[^a-z0-9\u3400-\u9fff]+", "", label.lower())
+            if not in_section and ("站长推荐" in compact_label or "stationpicks" in compact_label
+                                   or "stationrecommendations" in compact_label):
+                in_section = True
+                section_level = level
+                continue
+            if not in_section:
+                continue
+            if level <= section_level:
+                break
+            if scene_level is None:
+                scene_level = level
+            if level == scene_level:
+                current_scene = {"title": label, "text": []}
+                scenes.append(current_scene)
+            elif current_scene is not None:
+                current_scene["text"].append(label)
+        elif in_section and current_scene is not None:
+            current_scene["text"].append(event[1])
+
+    if not scenes:
+        fail("Codex Radar homepage has no recognizable Station Picks section")
+
+    model_effort_pattern = re.compile(
+        r"(?P<model>[A-Za-z0-9][A-Za-z0-9._-]*(?:[ \t]+[A-Za-z0-9][A-Za-z0-9._-]*)*)"
+        r"[ \t]+(?P<effort>[A-Za-z][A-Za-z0-9_-]{0,23})",
+        re.IGNORECASE,
+    )
+    raw_recommendations = []
+    for scene in scenes:
+        text = re.sub(r"[\u00a0\u3000]+", " ", "\n".join(scene["text"]))
+        items = []
+        seen = set()
+        for line in text.splitlines():
+            line = re.sub(r"(?i)(?:\s*[+＋]\s*|\s+)(?:fast|ultrafast)\b", " ", line)
+            line = line.strip(" \t\n.,;:|/()[]{}·")
+            for segment in re.split(r"\s*(?:/|·|;|；|\||,|，)\s*", line):
+                match = model_effort_pattern.fullmatch(segment.strip())
+                if not match:
+                    continue
+                model = match.group("model").strip(" \t\n.,;:|/()[]{}")
+                effort = match.group("effort").lower()
+                if (not model or effort in ("fast", "ultrafast")
+                        or not any(character.isalpha() for character in model)
+                        or not any(character.isdigit() for character in model)):
+                    continue
+                identity = (re.sub(r"\s+", "-", model.lower()), effort)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                items.append({"model": model, "effort": effort})
+        if not items:
+            continue
+        key = re.sub(r"[^a-z0-9]+", "_", scene["title"].lower()).strip("_")
+        if not key:
+            key = "scene-" + hashlib.sha256(scene["title"].encode("utf-8")).hexdigest()[:12]
+        raw_recommendations.append({"key": key, "title": scene["title"], "items": items})
+
+    if not raw_recommendations:
+        fail("Codex Radar homepage Station Picks contained no recognizable model/effort values")
+    return normalize_codex_radar({"recommendations": raw_recommendations}, options)
+
+
+def read_codex_radar_cache(path=None):
+    path = Path(path) if path else codex_radar_cache_path()
+    try:
+        cache = read(path)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(cache, dict):
+        return None
+    if cache.get("version") == 1:
+        # Drop the old hard-coded scene map but retain the failed-attempt
+        # timestamp and diagnostic so migration does not erase useful status.
+        cache = dict(cache)
+        cache.pop("scenes", None)
+        cache["version"] = 2
+        cache["recommendations"] = {"items": []}
+    if cache.get("version") != 2:
+        return None
+    if not isinstance(cache.get("recommendations"), dict):
+        return None
+    return cache
+
+
+def codex_radar_fetch(opener, url, accept):
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": accept,
+            "User-Agent": "agent-team/1 Codex-Radar-recommendations",
+            "Origin": "https://codexradar.com",
+            "Referer": "https://codexradar.com/",
+        },
+    )
+    with opener.open(request, timeout=4) as response:
+        body = response.read(2 * 1024 * 1024 + 1)
+    if len(body) > 2 * 1024 * 1024:
+        fail("Codex Radar response exceeds the 2 MiB limit")
+    return body
+
+
+def codex_radar_error_detail(url, error):
+    if isinstance(error, urllib.error.HTTPError):
+        detail = "HTTPError:" + str(error.code)
+    elif isinstance(error, RuntimeError):
+        detail = str(error)
+    else:
+        detail = type(error).__name__
+    return codex_radar_url_label(url) + " (" + detail + ")"
+
+
+def update_codex_radar_recommendations(force=False, strict=False, target="active"):
+    if target not in ("active", "pending"):
+        fail("Codex Radar cache target must be active or pending")
+    options = codex_radar_options()
+    now = time.time()
+    cache = read_codex_radar_cache()
+    if cache and cache.get("source_url") != options["url"]:
+        cache = None
+    interval = options.get("refresh_interval_seconds", 86400)
+    last_attempt = cache.get("last_attempt_at", cache.get("fetched_at", 0)) if cache else 0
+    if not isinstance(last_attempt, (int, float)):
+        last_attempt = 0
+    last_attempt_url = cache.get("last_attempt_url", cache.get("source_url")) if cache else None
+    if not force and cache and last_attempt_url == options["url"] and now - last_attempt < interval:
+        return cache, False
+
+    request_environment = environment({})
+    proxies = {
+        scheme: request_environment.get(scheme + "_proxy") or request_environment.get(scheme.upper() + "_PROXY")
+        for scheme in ("http", "https")
+    }
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({k: v for k, v in proxies.items() if v}))
+    fetch_errors = []
+    payload = None
+    fetched_url = options["url"]
+    source_format = "json"
+    source_warning = None
+    try:
+        body = codex_radar_fetch(opener, options["url"], "application/json")
+        payload = json.loads(body.decode("utf-8"))
+        recommendations = normalize_codex_radar(payload, options)
+        if not recommendations["items"] and options.get("html_fallback_url"):
+            fail("Codex Radar recommendations endpoint returned no recommendations")
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, UnicodeError, ValueError, TypeError, KeyError, RuntimeError) as primary_error:
+        fetch_errors.append((options["url"], primary_error))
+        fallback_url = options.get("html_fallback_url")
+        if isinstance(fallback_url, str) and fallback_url != options["url"]:
+            try:
+                body = codex_radar_fetch(opener, fallback_url, "text/html,application/xhtml+xml")
+                document = body.decode("utf-8")
+                recommendations = normalize_codex_radar_html(document, options)
+                fetched_url = fallback_url
+                payload = {}
+                source_format = "html"
+                source_warning = codex_radar_error_detail(options["url"], primary_error)
+            except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, UnicodeError, ValueError, TypeError, KeyError, RuntimeError) as fallback_error:
+                fetch_errors.append((fallback_url, fallback_error))
+
+    if fetch_errors and not source_warning:
+        error_summary = "; ".join(codex_radar_error_detail(url, error) for url, error in fetch_errors)
+        if strict:
+            fail("CodexRadar refresh failed: " + error_summary)
+        if cache is None:
+            cache = {"version": 2, "source_url": options["url"], "fetched_at": None,
+                     "recommendations": {"items": []}}
+        cache["last_attempt_at"] = now
+        cache["last_attempt_url"] = options["url"]
+        cache["last_error"] = error_summary
+        try:
+            cache_path = codex_radar_pending_cache_path() if target == "pending" else codex_radar_cache_path()
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            write(cache_path, cache)
+        except OSError:
+            if strict:
+                raise
+        return cache, False
+
+    cache = {
+        "version": 2,
+        "source_url": options["url"],
+        "last_attempt_url": options["url"],
+        "fetched_at": now,
+        "source_updated_at": payload.get("generated_at") or payload.get("updated_at"),
+        "last_attempt_at": now,
+        "fetched_from_url": fetched_url,
+        "source_format": source_format,
+        "source_warning": source_warning,
+        "recommendations": recommendations,
+    }
+    try:
+        cache_path = codex_radar_pending_cache_path() if target == "pending" else codex_radar_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        write(cache_path, cache)
+    except OSError:
+        if strict:
+            raise
+    return cache, True
+
+
+def codex_radar_has_data(cache):
+    recommendations = cache.get("recommendations", {}) if cache else {}
+    items = recommendations.get("items") if isinstance(recommendations, dict) else None
+    return isinstance(items, list) and bool(items)
+
+
+def codex_radar_refresh_lock_path():
+    return codex_radar_cache_path().with_name("codexradar-recommendations.refresh.lock")
+
+
+def start_codex_radar_background_refresh():
+    cache_path = codex_radar_cache_path()
+    lock_path = codex_radar_refresh_lock_path()
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    for _ in range(2):
+        try:
+            descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > 600:
+                    lock_path.unlink()
+                    continue
+            except OSError:
+                pass
+            return False
+        except OSError:
+            return False
+        try:
+            os.write(descriptor, str(os.getpid()).encode("ascii"))
+        except OSError:
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+            return False
+        finally:
+            os.close(descriptor)
+        try:
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "__refresh-codex-radar"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=environment({}),
+                close_fds=True,
+                start_new_session=True,
+            )
+        except OSError:
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+            return False
+        return True
+    return False
+
+
+def run_codex_radar_background_refresh():
+    try:
+        update_codex_radar_recommendations(force=True, target="pending")
+    finally:
+        try:
+            codex_radar_refresh_lock_path().unlink()
+        except FileNotFoundError:
+            pass
+
+
+def promote_codex_radar_pending(options):
+    pending_path = codex_radar_pending_cache_path()
+    pending = read_codex_radar_cache(pending_path)
+    if pending is None:
+        return read_codex_radar_cache()
+    active = read_codex_radar_cache()
+    if active and active.get("source_url") != options["url"]:
+        active = None
+    if pending.get("source_url") == options["url"]:
+        pending_time = pending.get("last_attempt_at", pending.get("fetched_at", 0))
+        active_time = active.get("last_attempt_at", active.get("fetched_at", 0)) if active else 0
+        if not isinstance(pending_time, (int, float)):
+            pending_time = 0
+        if not isinstance(active_time, (int, float)):
+            active_time = 0
+        if active is None or pending_time >= active_time:
+            try:
+                write(codex_radar_cache_path(), pending)
+                active = pending
+            except OSError:
+                return active
+    try:
+        pending_path.unlink()
+    except OSError:
+        pass
+    return active
+
+
+def prepare_codex_radar_for_menu():
+    options = codex_radar_options()
+    cache = promote_codex_radar_pending(options)
+    if cache and cache.get("source_url") != options["url"]:
+        cache = None
+    if cache is None:
+        cache, _ = update_codex_radar_recommendations(force=True)
+        return cache
+
+    last_attempt = cache.get("last_attempt_at", cache.get("fetched_at", 0))
+    if not isinstance(last_attempt, (int, float)):
+        last_attempt = 0
+    has_data = codex_radar_has_data(cache)
+    interval = options.get("refresh_interval_seconds", 86400)
+    retry_interval = interval if has_data else options.get("failure_retry_interval_seconds", 300)
+    if time.time() - last_attempt >= retry_interval:
+        if has_data:
+            start_codex_radar_background_refresh()
+        else:
+            cache, _ = update_codex_radar_recommendations(force=True)
+    return cache
+
+
+def apply_codex_radar_recommendation(target, recommendation, key, updated_at, team_roles=True):
+    target["model"] = recommendation["model"]
+    target["effort"] = recommendation["effort"]
+    if team_roles:
+        target["worker_model"] = recommendation["model"]
+        target["worker_effort"] = recommendation["effort"]
+        target.pop("lead_model", None)
+        target.pop("lead_effort", None)
+    target["recommendation_source"] = "codexradar.com"
+    target["recommendation_key"] = recommendation.get("source_key", key)
+    target["recommendation_updated_at"] = updated_at
+
+
+def recommendation_timestamp(cache):
+    if cache.get("source_updated_at"):
+        return str(cache["source_updated_at"])
+    fetched_at = cache.get("fetched_at")
+    if isinstance(fetched_at, (int, float)):
+        return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(fetched_at))
+    return None
+
+
+def codex_radar_command(argv):
+    parser = argparse.ArgumentParser(prog="agent-team recommendations")
+    parser.add_argument("action", choices=("status", "refresh", "prepare"))
+    args = parser.parse_args(argv)
+    if args.action == "refresh":
+        cache, _ = update_codex_radar_recommendations(force=True, strict=True)
+        try:
+            codex_radar_pending_cache_path().unlink()
+        except FileNotFoundError:
+            pass
+    elif args.action == "prepare":
+        prepare_codex_radar_for_menu()
+        return
+    else:
+        cache = read_codex_radar_cache()
+    options = codex_radar_options()
+    cache_matches_source = bool(cache and cache.get("source_url") == options["url"])
+    failed_endpoint = None
+    if cache and cache.get("last_error"):
+        endpoint = cache.get("last_attempt_url") or cache.get("source_url")
+        if isinstance(endpoint, str):
+            failed_endpoint = codex_radar_url_label(endpoint)
+    result = {
+        "source": options["url"],
+        "cache_source": cache.get("source_url") if cache else None,
+        "cache_needs_refresh": not cache_matches_source or not codex_radar_has_data(cache),
+        "cache_file": str(codex_radar_cache_path()),
+        "updated_at": recommendation_timestamp(cache) if cache_matches_source else None,
+        "fetched_from_url": cache.get("fetched_from_url") if cache_matches_source else None,
+        "source_format": cache.get("source_format") if cache_matches_source else None,
+        "source_warning": cache.get("source_warning") if cache_matches_source else None,
+        "recommendations": cache.get("recommendations", {}) if cache_matches_source else {},
+        "last_error": cache.get("last_error") if cache else None,
+        "last_error_endpoint": failed_endpoint,
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+SCENE_LABELS = {"daily": "日常开发", "hard": "复杂攻坚", "batch": "批量执行"}
 
 
 def scene_names(tool="codex"):
+    if tool == "codex":
+        return ()
     return tuple(read(CONFIG / "teams.json")[tool]["scenes"])
 
 
-def scene_settings(scene="daily", team=False, adjustment=None, tool="codex"):
+def has_tier_pair(value, model_key="model", effort_key="effort"):
+    return (isinstance(value.get(model_key), str) and bool(value[model_key])
+            and isinstance(value.get(effort_key), str) and bool(value[effort_key]))
+
+
+def codex_radar_model_version(model):
+    match = re.search(r"\d+(?:\.\d+)*", model)
+    return tuple(int(part) for part in match.group(0).split(".")) if match else ()
+
+
+def codex_radar_items(cache=None):
+    if cache is None:
+        if not CODEX_RADAR_RUNTIME:
+            return []
+        cache = CODEX_RADAR_MENU_CACHE if CODEX_RADAR_MENU_CACHE is not None else read_codex_radar_cache()
+    if not isinstance(cache, dict):
+        return []
+    try:
+        options = codex_radar_options()
+        if cache.get("source_url") != options["url"]:
+            return []
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        return []
+    recommendations = cache.get("recommendations", {})
+    items = recommendations.get("items", []) if isinstance(recommendations, dict) else []
+    return [item for item in items if isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and isinstance(item.get("model"), str)
+            and isinstance(item.get("effort"), str)] if isinstance(items, list) else []
+
+
+def codex_radar_menu_items(cache=None):
+    items = codex_radar_items(cache)
+    try:
+        limit = codex_radar_options().get("menu_category_limit", 4)
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        return []
+    categories = {}
+    for item in items:
+        category = item.get("source_key")
+        if not isinstance(category, str) or not category:
+            category = item["id"]
+        categories.setdefault(category, []).append(item)
+
+    selected = []
+    for choices in list(categories.values())[:limit]:
+        _, newest = max(enumerate(choices), key=lambda choice: (
+            codex_radar_model_version(choice[1]["model"]), choice[0]))
+        selected.append(newest)
+    return selected
+
+
+def codex_settings(recommendation_id=None, team=False, cache=None):
+    if cache is None and CODEX_RADAR_RUNTIME:
+        cache = CODEX_RADAR_MENU_CACHE if CODEX_RADAR_MENU_CACHE is not None else read_codex_radar_cache()
+    value = {"fast": False}
+    recommendation = next((item for item in codex_radar_items(cache)
+                           if item["id"] == recommendation_id), None) if recommendation_id else None
+    if recommendation:
+        apply_codex_radar_recommendation(
+            value, recommendation, recommendation.get("source_key", recommendation_id),
+            recommendation_timestamp(cache), team_roles=team,
+        )
+    value.update(recommendation_id=recommendation_id if recommendation else None)
+    value.setdefault("limit", 2)
+    value.setdefault("yolo", team)
+    return value
+
+
+def scene_settings(scene=None, team=False, adjustment=None, tool="codex"):
+    if tool == "codex":
+        return codex_settings(recommendation_id=scene, team=team)
     config = read(CONFIG / "teams.json")[tool]
     if scene not in config["scenes"]:
-        fail("Unknown " + tool + " scene: " + scene)
+        fail("Unknown " + tool + " scene: " + str(scene))
     value = dict(config["scenes"][scene])
     override = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-team/config.json"
     if override.exists():
         personal = read(override).get(tool, {})
-        obsolete = {"team", "budget", "expert", "solo"} & personal.keys()
-        if obsolete and tool == "codex":
-            fail("Migrate obsolete Codex presets in " + str(override) + " to codex.scenes before launching")
         merge(value, personal.get("scenes", {}).get(scene, {}))
     allowed = {"model", "effort", "lead_model", "lead_effort", "worker_model", "worker_effort", "fast", "limit", "yolo", "args", "worker_args", "env"}
     if set(value) - allowed:
@@ -70,9 +715,10 @@ def scene_settings(scene="daily", team=False, adjustment=None, tool="codex"):
     for key in ("args", "worker_args"):
         if key in value and (not isinstance(value[key], list) or not all(isinstance(arg, str) for arg in value[key])):
             fail("Scene " + key + " must be an array of CLI arguments")
-    if "env" in value and (not isinstance(value["env"], dict) or not all(isinstance(k, str) and isinstance(v, str) for k,v in value["env"].items())):
+    if "env" in value and (not isinstance(value["env"], dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in value["env"].items())):
         fail("Scene env must map string names to string values")
-    if not isinstance(value.get("fast"), bool):
+    value.setdefault("fast", False)
+    if not isinstance(value["fast"], bool):
         fail("Scene fast must be a boolean")
     for key in ("model", "effort", "worker_model", "worker_effort"):
         if not isinstance(value.get(key), str) or not value[key]:
@@ -85,7 +731,10 @@ def scene_settings(scene="daily", team=False, adjustment=None, tool="codex"):
     if adjustment:
         if adjustment != "quick":
             fail("Unknown temporary adjustment: " + adjustment)
-        value.update(config["adjustments"][adjustment])
+        adjustment_value = config.get("adjustments", {}).get(adjustment)
+        if not isinstance(adjustment_value, dict):
+            fail("Unknown " + tool + " adjustment: " + adjustment)
+        value.update(adjustment_value)
     value.update(scene=scene, adjustment=adjustment)
     value.setdefault("limit", 2)
     value.setdefault("yolo", team)
@@ -104,16 +753,18 @@ def validate_scene_models(cfg, team=False, tool="codex"):
         models = json.loads(result.stdout).get("models", [])
         catalog = {alias: model for model in models for alias in (model.get("slug"), model.get("config_name")) if alias}
         return validate_catalog(cfg, team, catalog)
+    if not has_tier_pair(cfg):
+        return
     path = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "models_cache.json"
     if not path.exists():
-        fail("Codex model catalog is unavailable; refresh Codex's model list before launching a scene")
+        fail("Codex model catalog is unavailable; cannot validate the selected CodexRadar recommendation")
     catalog = {model["slug"]: model for model in read(path).get("models", [])}
     return validate_catalog(cfg, team, catalog)
 
 
 def validate_catalog(cfg, team, catalog):
-    roles = [(cfg["model"], cfg["effort"]) ]
-    if team:
+    roles = [(cfg["model"], cfg["effort"])] if has_tier_pair(cfg) else []
+    if team and has_tier_pair(cfg, "worker_model", "worker_effort"):
         roles.append((cfg["worker_model"], cfg["worker_effort"]))
     for model, effort in roles:
         available = catalog.get(model)
@@ -128,10 +779,14 @@ def validate_catalog(cfg, team, catalog):
 
 def start_codex(argv, tool="codex"):
     parser = argparse.ArgumentParser(prog="agent-team start " + tool)
-    parser.add_argument("--scene", choices=scene_names(tool), default="daily")
+    if tool == "codex":
+        parser.add_argument("--recommendation", "--scene", dest="recommendation")
+    else:
+        parser.add_argument("--scene", choices=scene_names(tool), default="daily")
+        parser.add_argument("--adjust", choices=["quick"])
     parser.add_argument("--team", action="store_true")
     parser.add_argument("--tmux", action="store_true")
-    parser.add_argument("--adjust", choices=["quick"])
+    parser.add_argument("--fast", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--check", action="store_true", help="Validate scene availability without starting a session")
     parser.add_argument("--no-yolo", action="store_true")
@@ -139,21 +794,34 @@ def start_codex(argv, tool="codex"):
     options, extra = parser.parse_known_args(argv)
     if options.tmux and not options.team:
         fail("--tmux requires --team")
-    cfg = scene_settings(options.scene, options.team, options.adjust, tool=tool)
+    if tool == "codex":
+        cfg = codex_settings(options.recommendation, options.team)
+    else:
+        cfg = scene_settings(options.scene, options.team, options.adjust, tool=tool)
+    if options.fast is not None:
+        cfg["fast"] = options.fast
+        cfg["fast_explicit"] = True
     if options.no_yolo:
         cfg["yolo"] = False
+    if tool == "codex" and not has_tier_pair(cfg):
+        message = "CodexRadar recommendation unavailable;" if options.recommendation else "No CodexRadar recommendation selected;"
+        print("agent-team: " + message + " using Codex defaults", file=sys.stderr)
     if options.check:
         validate_scene_models(cfg, options.team, tool=tool)
         options.dry_run = True
     if options.team:
         flags = (["--tmux"] if options.tmux else []) + (["--team-dry-run"] if options.dry_run else [])
         return launch(tool, flags + extra, resolved=cfg)
-    args = [tool, "-m", cfg["model"], "-c", "model_reasoning_effort=" + json.dumps(cfg["effort"])]
+    args = [tool]
+    if cfg.get("model") and cfg.get("effort"):
+        args += ["-m", cfg["model"], "-c", "model_reasoning_effort=" + json.dumps(cfg["effort"])]
     if tool == "codex":
         args[1:1] = ["--no-daemon"]
-        args += ["-c", "plan_mode_reasoning_effort=" + json.dumps(cfg["effort"]),
-                 "-c", "service_tier=" + json.dumps("fast" if cfg["fast"] else "default"),
-                 "-c", "agents.enabled=false"]
+        if cfg.get("effort"):
+            args += ["-c", "plan_mode_reasoning_effort=" + json.dumps(cfg["effort"])]
+        if cfg.get("fast_explicit") or cfg.get("fast"):
+            args += ["-c", "service_tier=" + json.dumps("fast" if cfg["fast"] else "default")]
+        args += ["-c", "agents.enabled=false"]
     else:
         args += ["--disable", "multi_agent", "--disable", "multi_agent_v2"]
     if cfg["yolo"]:
@@ -161,7 +829,9 @@ def start_codex(argv, tool="codex"):
     args.extend(cfg.get("args", []))
     args.extend(extra)
     if options.dry_run:
-        print(json.dumps({"tool":tool, "mode":"single", "scene":options.scene,
+        print(json.dumps({"tool":tool, "mode":"single",
+                          "recommendation_id":cfg.get("recommendation_id") if tool == "codex" else None,
+                          "scene":options.scene if tool == "traex" else None,
                           "config":cfg, "argv":args}, indent=2))
         return
     # The disk catalog can predate a model rollout. Let Codex refresh it during
@@ -179,7 +849,7 @@ def start_simple(argv, tool):
     parser = argparse.ArgumentParser(prog="agent-team start " + tool, allow_abbrev=False)
     parser.add_argument("--team", action="store_true")
     parser.add_argument("--tmux", action="store_true")
-    parser.add_argument("--scene", choices=scene_names())
+    parser.add_argument("--scene")
     parser.add_argument("--adjust", choices=["quick"])
     parser.add_argument("--fast", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--dry-run", action="store_true")
@@ -214,7 +884,7 @@ def start_simple(argv, tool):
 def settings(tool, budget, expert=False):
     if tool == "codex":
         if budget or expert:
-            fail("Codex budget/expert presets were removed; use --scene " + "|".join(scene_names()))
+            fail("Codex budget/expert presets were removed; select a CodexRadar recommendation with --recommendation ID")
         return scene_settings(team=True)
     config = read(CONFIG / "teams.json")
     if expert and tool != "codex":
@@ -316,7 +986,13 @@ def launch_solo(argv):
 
 def instructions(mode, worker=False, cfg=None, budget=False, expert=False):
     cfg = cfg or {}
-    selected = {"scene": cfg.get("scene"), "fast": cfg.get("fast"), "preset": ("scene:" + cfg["scene"] + ":team") if cfg.get("scene") else ("team-expert" if expert else "team-budget" if budget else "team"), "mode": mode,
+    recommendation_id = cfg.get("recommendation_id")
+    scene = cfg.get("scene")
+    preset = ("recommendation:" + recommendation_id + ":team" if recommendation_id else
+              "scene:" + scene + ":team" if scene else
+              "team-expert" if expert else "team-budget" if budget else "team")
+    selected = {"recommendation_id": recommendation_id, "scene": scene,
+                "fast": cfg.get("fast"), "preset": preset, "mode": mode,
                 **{key: cfg.get(key) for key in ("model", "effort", "worker_model", "worker_effort")}}
     common = ("Resolved configuration for THIS invocation (authoritative; do not infer it "
               "from other profiles or repository examples):\n" + json.dumps(selected) + "\n"
@@ -383,7 +1059,7 @@ def command(tool, cfg, mode, worker=False, extra=(), brief=None, budget=False, e
                 path.write_text(role)
                 args += ["-c", "agents.team-worker.description=" + json.dumps("Independent team work using the selected worker combination")]
                 args += ["-c", "agents.team-worker.config_file=" + json.dumps(str(path))]
-        if tool == "codex" and "fast" in cfg:
+        if tool == "codex" and (cfg.get("fast_explicit") or cfg.get("fast")):
             args += ["-c", "service_tier=" + json.dumps("fast" if cfg["fast"] else "default")]
         if effort and tool == "codex":
             args += ["-c", "plan_mode_reasoning_effort=" + json.dumps(effort)]
@@ -931,15 +1607,21 @@ def control(argv):
 
 
 def main():
+    global CODEX_RADAR_MENU_CACHE, CODEX_RADAR_RUNTIME
+    CODEX_RADAR_RUNTIME = True
     argv = sys.argv[1:]
+    if argv == ["__refresh-codex-radar"]:
+        return run_codex_radar_background_refresh()
+    if argv and argv[0] == "recommendations":
+        return codex_radar_command(argv[1:])
     if argv and argv[0] == "start":
         if len(argv) < 2 or argv[1] not in TOOLS:
-            fail("Usage: agent-team start <codex|traex|claude|opencode> [--scene SCENE] [--team] [--tmux]")
+            fail("Usage: agent-team start <codex|traex|claude|opencode> [--recommendation ID] [--scene SCENE] [--team] [--tmux]")
         if argv[1] in ("claude", "opencode"):
             return start_simple(argv[2:], tool=argv[1])
         return start_codex(argv[2:], tool=argv[1])
     if argv and argv[0] == "solo" and len(argv) > 1 and argv[1] == "codex":
-        fail("Codex solo presets were removed; use agent-team start codex --scene " + "|".join(scene_names()))
+        fail("Codex tier presets were removed; use agent-team start codex [--recommendation ID]")
     if argv and argv[0] == "solo":
         return launch_solo(argv[1:])
     if not argv or argv == ["--tmux"]:
@@ -954,7 +1636,27 @@ def main():
         if not choice.isdigit() or not 1 <= int(choice) <= len(available):
             fail("Invalid agent selection")
         tool = available[int(choice) - 1]
-        if tool in ("codex", "traex"):
+        if tool == "codex":
+            CODEX_RADAR_MENU_CACHE = prepare_codex_radar_for_menu()
+            recommendations = codex_radar_menu_items(CODEX_RADAR_MENU_CACHE)
+            if recommendations:
+                for number, item in enumerate(recommendations, 1):
+                    print(f"{number}. {item['label']}")
+                choice = input("CodexRadar recommendation [1]: ").strip() or "1"
+                if not choice.isdigit() or not 1 <= int(choice) <= len(recommendations):
+                    fail("Invalid recommendation selection")
+                flags = ["--recommendation", recommendations[int(choice) - 1]["id"]]
+            else:
+                print("CodexRadar recommendations unavailable; using Codex defaults.")
+                flags = []
+            team = input("模式: 1. Single  2. Team [1]: ").strip() or "1"
+            if team not in ("1", "2"):
+                fail("Invalid mode selection")
+            if team == "2":
+                flags.append("--team")
+            flags.extend(argv)
+            return start_codex(flags, tool=tool)
+        if tool == "traex":
             scenes = scene_names(tool)
             labels = "  ".join(f"{number}. {SCENE_LABELS.get(scene, scene)}" for number, scene in enumerate(scenes, 1))
             choice = input("场景: " + labels + " [1]: ").strip() or "1"
@@ -979,9 +1681,10 @@ def main():
         return launch(argv[0], argv[1:])
     if argv[0] in ("-h", "--help"):
         print("Usage: agent-team [--tmux]  # choose a coding agent interactively\n"
+              "       agent-team recommendations <status|refresh|prepare>\n"
               "       agent-team <traex|opencode|claude> [--team-budget] [--tmux] [CLI args]\n"
-              "       agent-team start <codex|traex|claude|opencode> [--scene SCENE] [--team] [--tmux] [--adjust quick] [CLI args]\n"
-              "Codex scenes: daily|hard|batch|computer. Trae scenes: daily|hard|batch.\n"
+              "       agent-team start <codex|traex|claude|opencode> [--recommendation ID] [--scene SCENE] [--team] [--tmux] [--fast|--no-fast] [CLI args]\n"
+              "Codex recommendations are loaded from CodexRadar; without a recommendation Codex uses its defaults. Trae scenes: daily|hard|batch.\n"
 
               "       agent-team solo traex budget [TraeX args]\n"
               "       agent-team run <traex|opencode|claude> [--budget] [--no-yolo] [CLI args]\n"
@@ -1006,6 +1709,7 @@ def main():
 
 
 if __name__ == "__main__":
+    CODEX_RADAR_RUNTIME = True
     try:
         sys.exit(main() or 0)
     except (RuntimeError, OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
