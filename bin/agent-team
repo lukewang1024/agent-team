@@ -623,6 +623,252 @@ def codex_radar_command(argv):
 SCENE_LABELS = {"daily": "日常开发", "hard": "复杂攻坚", "batch": "批量执行"}
 
 
+def model_key(model):
+    if not isinstance(model, str):
+        return ""
+    value = model.strip().lower().replace("‑", "-").replace("–", "-")
+    if "/" in value:
+        value = value.rsplit("/", 1)[-1]
+    return re.sub(r"[^a-z0-9.]+", "-", value).strip("-")
+
+
+def model_tier(model, policy):
+    key = model_key(model)
+    tier = policy["model_tiers"].get(key)
+    if tier is not None:
+        return tier
+    for family, tier in sorted(policy["model_families"].items(), key=lambda item: len(item[0]), reverse=True):
+        if key == family or key.endswith("-" + family):
+            return tier
+    return None
+
+
+def model_policy_config():
+    policy = read(CONFIG / "model-levels.json")
+    if not isinstance(policy, dict):
+        fail("Built-in model policy must be a JSON object")
+    override = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-team/model-levels.json"
+    if override.exists():
+        custom = read(override)
+        if not isinstance(custom, dict):
+            fail("Custom model policy must be a JSON object")
+        policy_keys = {"model_tiers", "model_families", "thinking_levels",
+                       "default_thinking_level", "latest_models"}
+        if not (policy_keys & custom.keys()):
+            # Continue to accept the original {model: level} override format.
+            custom = {"model_tiers": custom}
+        merge(policy, custom)
+
+    tiers = policy.get("model_tiers")
+    if not isinstance(tiers, dict):
+        fail("model_tiers must map model names to positive integers")
+    normalized_tiers = {}
+    for name, level in tiers.items():
+        if not isinstance(name, str) or not name or type(level) is not int or level < 1:
+            fail("model_tiers must map model names to positive integers")
+        key = model_key(name)
+        if not key:
+            fail("model_tiers keys must contain a model name")
+        normalized_tiers[key] = level
+
+    families = policy.get("model_families", {})
+    if not isinstance(families, dict):
+        fail("model_families must map model-family suffixes to positive integers")
+    normalized_families = {}
+    for name, level in families.items():
+        if not isinstance(name, str) or not name or type(level) is not int or level < 1:
+            fail("model_families must map model-family suffixes to positive integers")
+        key = model_key(name)
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", key) or key in normalized_families:
+            fail("model_families keys must be unique family names")
+        normalized_families[key] = level
+    for key, level in normalized_tiers.items():
+        for family, family_level in normalized_families.items():
+            if (key == family or key.endswith("-" + family)) and level != family_level:
+                fail("Model tier conflicts with its configured family: " + key)
+
+    thinking = policy.get("thinking_levels")
+    if not isinstance(thinking, dict) or not thinking:
+        fail("thinking_levels must map effort names to positive integer ranks")
+    normalized_thinking = {}
+    for name, rank in thinking.items():
+        if not isinstance(name, str) or not name or type(rank) is not int or not 1 <= rank <= 9:
+            fail("thinking_levels must map effort names to integer ranks from 1 to 9")
+        key = name.strip().lower()
+        if not key or key in normalized_thinking:
+            fail("thinking_levels must contain unique nonempty effort names")
+        normalized_thinking[key] = rank
+    if len(set(normalized_thinking.values())) != len(normalized_thinking):
+        fail("thinking_levels ranks must be unique")
+    default_effort = policy.get("default_thinking_level")
+    if not isinstance(default_effort, str) or default_effort.strip().lower() not in normalized_thinking:
+        fail("default_thinking_level must name an entry in thinking_levels")
+
+    latest = policy.get("latest_models", {})
+    if not isinstance(latest, dict):
+        fail("latest_models must map tool names to model arrays")
+    normalized_latest = {}
+    for tool, models in latest.items():
+        if not isinstance(tool, str) or not tool or not isinstance(models, list) or not all(
+                isinstance(model, str) and model for model in models):
+            fail("latest_models must map tool names to arrays of model names")
+        seen_tiers = set()
+        seen_models = set()
+        for model in models:
+            key = model_key(model)
+            tier = model_tier(model, {
+                "model_tiers": normalized_tiers,
+                "model_families": normalized_families,
+            })
+            if tier is None:
+                fail("Latest model has no configured tier: " + model)
+            if key in seen_models or tier in seen_tiers:
+                fail("latest_models must contain only one model per tier for " + tool)
+            seen_models.add(key)
+            seen_tiers.add(tier)
+        normalized_latest[tool] = models
+    return {"model_tiers": normalized_tiers, "model_families": normalized_families,
+            "thinking_levels": normalized_thinking,
+            "default_thinking_level": default_effort.strip().lower(), "latest_models": normalized_latest}
+
+
+def thinking_rank(effort, policy):
+    name = (effort or policy["default_thinking_level"]).strip().lower()
+    rank = policy["thinking_levels"].get(name)
+    if rank is None:
+        fail("Thinking level has no configured rank: " + name
+             + "; add it to config/model-levels.json")
+    return rank
+
+
+def display_level(level):
+    return str(level // 10) + "." + str(level % 10)
+
+
+def validate_model_ceiling(main_model, main_effort, subagent_model, subagent_effort):
+    subagent_model = subagent_model or main_model
+    policy = model_policy_config()
+    if not subagent_model:
+        main_rank = thinking_rank(main_effort, policy)
+        subagent_rank = thinking_rank(subagent_effort or main_effort, policy)
+        if subagent_rank > main_rank:
+            fail("Subagent thinking level exceeds the lead: "
+                 + (subagent_effort or main_effort or policy["default_thinking_level"])
+                 + " > " + (main_effort or policy["default_thinking_level"]))
+        return
+    if not main_model:
+        fail("Cannot enforce the subagent model ceiling without an explicit lead model")
+    main_key, subagent_key = model_key(main_model), model_key(subagent_model)
+    main_tier = model_tier(main_model, policy)
+    subagent_tier = model_tier(subagent_model, policy)
+    subagent_effort = subagent_effort or main_effort
+    main_rank = thinking_rank(main_effort, policy)
+    subagent_rank = thinking_rank(subagent_effort, policy)
+    if main_key == subagent_key and main_tier is None:
+        if subagent_rank > main_rank:
+            fail("Subagent thinking level exceeds the lead: " + (subagent_effort or policy["default_thinking_level"])
+                 + " > " + (main_effort or policy["default_thinking_level"]))
+        return
+    if main_tier is None:
+        fail("Lead model has no configured level: " + main_model
+             + "; add it to config/model-levels.json or use the same model for workers")
+    if subagent_tier is None:
+        fail("Subagent model has no configured level: " + subagent_model
+             + "; add it to config/model-levels.json")
+    main_level = main_tier * 10 + main_rank
+    subagent_level = subagent_tier * 10 + subagent_rank
+    if subagent_level > main_level:
+        fail("Subagent combined level exceeds the lead: " + subagent_model + " "
+             + display_level(subagent_level) + " > " + main_model + " " + display_level(main_level))
+
+
+def latest_models_by_tier(policy, tool):
+    candidates = list(policy["latest_models"].get(tool, []))
+    if tool == "codex":
+        candidates.extend(item["model"] for item in codex_radar_items())
+    latest = {}
+    for order, model in enumerate(candidates):
+        tier = model_tier(model, policy)
+        if tier is None:
+            continue
+        version = codex_radar_model_version(model)
+        current = latest.get(tier)
+        if current is None or (version, order) > (current["version"], current["order"]):
+            latest[tier] = {"model": model, "version": version, "order": order}
+    return {tier: value["model"] for tier, value in latest.items()}
+
+
+def latest_worker_config(cfg, tool):
+    result = dict(cfg)
+    policy = model_policy_config()
+    current = result.get("worker_model") or result.get("model")
+    if not current:
+        return result
+    tier = model_tier(current, policy)
+    if tier is None:
+        return result
+    latest = latest_models_by_tier(policy, tool)
+    if tier in latest:
+        result["worker_model"] = latest[tier]
+    return result
+
+
+def model_policy(cfg, tool, mode):
+    main_model = cfg.get("model")
+    cfg = latest_worker_config(cfg, tool)
+    policy = model_policy_config()
+    lead_effort = cfg.get("effort") or policy["default_thinking_level"]
+    default_model = cfg.get("worker_model") or main_model
+    default_effort = cfg.get("worker_effort") or lead_effort
+    main_tier = model_tier(main_model, policy) if main_model else None
+    lead_rank = thinking_rank(lead_effort, policy)
+    lead_level = main_tier * 10 + lead_rank if main_tier is not None else None
+
+    latest = latest_models_by_tier(policy, tool)
+    if latest:
+        candidates = [latest[tier] for tier in sorted(latest)]
+    else:
+        candidates = list(dict.fromkeys(model for model in (default_model, main_model) if model))
+    allowed_settings = []
+    allowed_models = []
+    for candidate in candidates:
+        tier = model_tier(candidate, policy)
+        if main_tier is None:
+            if model_key(candidate) != model_key(main_model):
+                continue
+            effort_ranks = [(name, rank) for name, rank in policy["thinking_levels"].items() if rank <= lead_rank]
+        elif tier is None or tier > main_tier:
+            continue
+        else:
+            effort_ranks = [(name, rank) for name, rank in policy["thinking_levels"].items()
+                            if tier * 10 + rank <= lead_level]
+        if not any(model_key(candidate) == model_key(model) for model in allowed_models):
+            allowed_models.append(candidate)
+        for effort, rank in sorted(effort_ranks, key=lambda item: item[1]):
+            level = (tier * 10 + rank) if tier is not None else rank
+            allowed_settings.append({"model": candidate, "effort": effort,
+                                     "level": display_level(level) if tier is not None else effort})
+    default_tier = model_tier(default_model, policy) if default_model else None
+    if default_model and default_tier is not None:
+        default_level = display_level(default_tier * 10 + thinking_rank(default_effort, policy))
+    elif default_model:
+        default_level = default_effort
+    else:
+        default_level = None
+    dynamic = mode == "tmux" or (mode == "native" and tool == "codex")
+    return {
+        "lead_model": main_model,
+        "lead_effort": lead_effort,
+        "lead_level": display_level(lead_level) if lead_level is not None else None,
+        "default_worker_model": default_model,
+        "default_worker_effort": default_effort,
+        "default_worker_level": default_level,
+        "allowed_worker_models": allowed_models,
+        "allowed_worker_settings": allowed_settings,
+        "select_per_task": dynamic and len(allowed_settings) > 1,
+    }
+
+
 def scene_names(tool="codex"):
     if tool == "codex":
         return ()
@@ -728,6 +974,7 @@ def scene_settings(scene=None, team=False, adjustment=None, tool="codex"):
             fail("Scene " + key + " must be a nonempty string")
     if team:
         value["model"], value["effort"] = value.get("lead_model", value["model"]), value.get("lead_effort", value["effort"])
+        value = latest_worker_config(value, tool)
     if adjustment:
         if adjustment != "quick":
             fail("Unknown temporary adjustment: " + adjustment)
@@ -984,7 +1231,7 @@ def launch_solo(argv):
     return os.execvpe(tool, args, env)
 
 
-def instructions(mode, worker=False, cfg=None, budget=False, expert=False):
+def instructions(mode, worker=False, cfg=None, budget=False, expert=False, tool="codex"):
     cfg = cfg or {}
     recommendation_id = cfg.get("recommendation_id")
     scene = cfg.get("scene")
@@ -994,13 +1241,30 @@ def instructions(mode, worker=False, cfg=None, budget=False, expert=False):
     selected = {"recommendation_id": recommendation_id, "scene": scene,
                 "fast": cfg.get("fast"), "preset": preset, "mode": mode,
                 **{key: cfg.get(key) for key in ("model", "effort", "worker_model", "worker_effort")}}
+    policy = model_policy(cfg, tool, mode)
+    if worker:
+        policy["select_per_task"] = False
+    selected["model_policy"] = policy
+    if policy["select_per_task"]:
+        model_instruction = (
+            "Choose each worker model and reasoning effort together from "
+            "model_policy.allowed_worker_settings. The default worker combination is a fallback, "
+            "not a fixed assignment. Set both model and reasoning_effort on each spawn "
+            "when the runtime accepts them. Never choose a combined level above lead_level; "
+            "the lead's own model and effort remain unchanged.\n"
+        )
+    else:
+        model_instruction = (
+            "Use the configured worker model and reasoning effort when delegating. Do not "
+            "substitute another model or switch presets.\n"
+        )
     common = ("Resolved configuration for THIS invocation (authoritative; do not infer it "
               "from other profiles or repository examples):\n" + json.dumps(selected) + "\n"
-              "Use exactly these configured worker settings when delegating. Never substitute "
-              "another model/effort or automatically switch presets. If the native spawn tool "
-              "accepts model and reasoning_effort, explicitly pass worker_model and worker_effort "
-              "when non-null, with fresh context (fork_turns=none). Leave null settings inherited. "
-              "If unavailable, report a blocker; do not silently fall back.\n"
+              + model_instruction
+              + "Do not switch the lead's preset. For native Codex spawns, use fresh context "
+              "(fork_turns=none). Leave an omitted reasoning setting inherited only when the "
+              "spawn runtime cannot accept it; report unavailable model choices rather than "
+              "silently falling back.\n"
               + (CONFIG / "team-rules.md").read_text())
     if worker:
         return "You are a team worker. Do not spawn agents. Follow your assigned brief.\n" + (CONFIG / "team-pane.md").read_text() + common
@@ -1019,7 +1283,7 @@ def command(tool, cfg, mode, worker=False, extra=(), brief=None, budget=False, e
         for key in tuple(env):
             if key.startswith("AGENT_TEAM_"):
                 env.pop(key)
-    prompt = instructions(mode, worker, cfg, budget, expert)
+    prompt = instructions(mode, worker, cfg, budget, expert, tool)
     if mode == "tmux" and os.environ.get("AGENT_TEAM_DIR"):
         prefix = shlex.join(["env", "AGENT_TEAM_DIR=" + os.environ["AGENT_TEAM_DIR"],
                              "AGENT_TEAM_ROLE=" + os.environ.get("AGENT_TEAM_ROLE", "lead"), "agent-team"])
@@ -1311,6 +1575,9 @@ def launch(tool, argv, resolved=None):
     cfg = resolved if resolved is not None else settings(tool, budget, expert)
     if no_yolo:
         cfg["yolo"] = False
+    cfg = latest_worker_config(cfg, tool)
+    validate_model_ceiling(cfg.get("model"), cfg.get("effort"), cfg.get("worker_model"),
+                           cfg.get("worker_effort"))
     mode = "tmux" if pane_mode else "native"
     forbidden = {"--remote"}
     forbidden.update({"-p", "--print", "--background", "--bg"} if tool == "claude" else {"exec", "run", "attach", "serve"})
@@ -1470,8 +1737,14 @@ def run_pane(directory, name):
     os.environ["AGENT_TEAM_DIR"] = str(directory)
     os.environ["AGENT_TEAM_ROLE"] = name
     worker = name != "lead"
-    brief = state["members"][name].get("brief") if worker else None
-    args, env = command(state["tool"], state["config"], "tmux", worker,
+    member = state["members"][name]
+    brief = member.get("brief") if worker else None
+    cfg = state["config"]
+    if worker:
+        cfg = dict(cfg)
+        cfg["worker_model"] = member.get("model", cfg.get("worker_model"))
+        cfg["worker_effort"] = member.get("effort", cfg.get("worker_effort"))
+    args, env = command(state["tool"], cfg, "tmux", worker,
                         extra=() if worker else state["extra"], brief=brief,
                         budget=state["budget"], expert=state.get("expert", False))
     try:
@@ -1511,6 +1784,8 @@ def control(argv):
     spawn = subs.add_parser("spawn")
     spawn.add_argument("name")
     spawn.add_argument("--file", required=True, help="UTF-8 task brief")
+    spawn.add_argument("--model", help="Per-worker model; combined level must not exceed the lead")
+    spawn.add_argument("--effort", help="Per-worker reasoning effort")
     send = subs.add_parser("send")
     send.add_argument("name")
     send.add_argument("--file", required=True)
@@ -1557,19 +1832,26 @@ def control(argv):
             active = [m for n, m in state["members"].items() if n != "lead" and owned(state, m["pane"])]
             if len(active) >= state["config"]["limit"]:
                 fail("Worker limit reached; reuse or stop an existing worker")
+            model = args.model or state["config"].get("worker_model") or state["config"].get("model")
+            policy = model_policy_config()
+            effort = (args.effort or state["config"].get("worker_effort")
+                      or state["config"].get("effort") or policy["default_thinking_level"])
+            validate_model_ceiling(state["config"].get("model"), state["config"].get("effort"),
+                                   model, effort)
             brief = Path(args.file).read_text()
             pane = tmux("split-window", "-d", "-P", "-F", "#{pane_id}", "-t", state["members"]["lead"]["pane"], "-c", state["cwd"], runner(directory, args.name))
             try:
                 tmux("set-option", "-p", "-t", pane, "@agent_team", state["id"])
                 tmux("set-option", "-p", "-t", pane, "@agent_team_role", "worker")
                 tmux("select-pane", "-t", pane, "-T", args.name)
-                state["members"][args.name] = {"pane": pane, "status": "running", "cursor": 0, "brief": brief}
+                state["members"][args.name] = {"pane": pane, "status": "running", "cursor": 0,
+                                               "brief": brief, "model": model, "effort": effort}
                 layout(state)
             except BaseException:
                 tmux("kill-pane", "-t", pane, check=False)
                 state["members"].pop(args.name, None)
                 raise
-            print(json.dumps({"name": args.name, "pane": pane}))
+            print(json.dumps({"name": args.name, "pane": pane, "model": model, "effort": effort}))
         elif args.action in ("send", "report"):
             target = args.name if args.action == "send" else "lead"
             if target not in state["members"]:
@@ -1593,7 +1875,10 @@ def control(argv):
                 state["members"][role]["cursor"] = messages[-1]["id"]
             print(json.dumps(messages, ensure_ascii=False))
         elif args.action == "status":
-            print(json.dumps({n: {"pane": m["pane"], "status": m["status"], "alive": owned(state, m["pane"])} for n, m in state["members"].items()}, indent=2))
+            print(json.dumps({n: {"pane": m["pane"], "status": m["status"], "alive": owned(state, m["pane"]),
+                                "model": m.get("model", state["config"].get("model") if n == "lead" else state["config"].get("worker_model")),
+                                "effort": m.get("effort", state["config"].get("effort") if n == "lead" else state["config"].get("worker_effort"))}
+                              for n, m in state["members"].items()}, indent=2))
         elif args.action == "stop":
             if role != "lead" or args.name == "lead":
                 fail("Only the lead may stop workers")

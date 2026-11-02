@@ -17,10 +17,20 @@ pane workers through `agent-team`, following the injected pane protocol. Do not
 mix the two modes or migrate running members between them. Opt-in pane mode
 uses a dedicated team window and leaves existing windows and panes unchanged.
 
-Use the configured subagent model and reasoning effort, independently of the
-primary agent's settings. These combinations are user-customizable; no model
-choice is implied by the entrypoint name. Do not switch budget profiles or
-silently raise model or reasoning settings automatically.
+Choose each subagent's model for its task using the injected `model_policy`.
+`default_worker_model` and `default_worker_effort` are the fallback pair. When
+per-task selection is available, select a model and effort pair from
+`allowed_worker_settings` and set both on that spawn. The `level` field is the
+combined model and thinking level; never exceed `lead_level`, and never change
+the lead's model or effort or switch its preset. Defaults use the latest model
+generation configured for that CLI and tier. For Codex, a newer generation in
+the active CodexRadar cache takes precedence for that tier. A request for an
+unavailable model or effort is a blocker; do not silently fall back.
+
+Native Codex supports per-spawn model and effort selection. In pane mode, pass
+the selected pair to `agent-team spawn`; the controller validates the combined
+ceiling before creating a worker. Other native adapters retain their configured
+worker pair where their spawn interface cannot choose one per task.
 
 ### Assign bounded work
 

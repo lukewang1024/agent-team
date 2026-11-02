@@ -139,6 +139,25 @@ notification API. `send --wake` submits a notice to an idle worker's input;
 avoid doing that while a person is typing. Lead exit normally closes worker panes.
 Forced terminal/server termination may need manual cleanup of the team window.
 
+For Codex native teams, the main agent can choose a model and thinking level for
+each spawn; the configured `worker_model` and `worker_effort` are the default
+pair. In `--tmux` mode, choose per worker with
+`agent-team spawn <name> --file <brief> --model <model> --effort <effort>`.
+The combined level is the model tier followed by the thinking rank: Luna (1),
+Terra (2), Sol (3), Astra (4); low (1), medium (2), high (3), xhigh (4), max (5),
+ultra (6). For example, Sol max is 3.5 and Astra xhigh is 4.4. A Sol high lead
+(3.3) can use Sol high or any lower combined level, but cannot use Sol xhigh or
+any Astra model. Defaults offer only the latest model generation configured for
+each CLI and tier. Codex also considers newer generations in the active
+CodexRadar cache for worker choices, while the selected main-agent recommendation
+remains the exact CodexRadar model/effort pair. Model-family suffixes map to the
+Luna/Terra/Sol/Astra tiers, including future versioned names such as `gpt-7-sol`.
+Trae retains its configured GPT-5.6 Luna default because its current catalog has
+no GPT-6 Luna. These mappings are listed in
+[model-levels.json](config/model-levels.json). Native Codex expresses this
+ceiling as an agent instruction because native spawn calls do not pass through
+the `agent-team` controller; tmux spawn requests are rejected by the controller.
+
 Customize combinations in `$XDG_CONFIG_HOME/agent-team/config.json`
 (default `~/.config/agent-team/config.json`). This is a partial override of
 [teams.json](config/teams.json); omitted values use the CLI's existing defaults.
@@ -153,6 +172,19 @@ For example (replace model identifiers with ones your provider supports):
 }
 ```
 
+Because that example uses different Claude models for lead and worker, add their
+tiers to `$XDG_CONFIG_HOME/agent-team/model-levels.json`:
+
+```json
+{
+  "model_tiers": {"opus": 4, "sonnet": 3, "haiku": 1},
+  "latest_models": {"claude": ["haiku", "sonnet", "opus"]}
+}
+```
+
+Thinking ranks come from the built-in policy unless overridden. The combined
+worker level must not exceed the lead's model tier and thinking rank.
+
 Supported team keys: `model`, `effort`, `worker_model`, `worker_effort`, `limit` (1 or
 2), `yolo` (boolean, default true), `args`, `worker_args` (CLI argument arrays),
 and agent-level `env` defaults. Environment defaults apply only when the
@@ -162,10 +194,19 @@ and delegation rules are independent of model choices. Other tools have no
 assumed budget model: configure a distinct budget combination when desired.
 There is no automatic budget switching.
 
-Codex recommendation choices come from CodexRadar and are cached locally; the
-launcher does not define a built-in Codex scene catalog. If recommendations are
-unavailable, Codex starts with its native model and reasoning defaults. Fast is
-never taken from a recommendation and is only enabled with an explicit `--fast`.
+Codex model and effort choices come from the selected CodexRadar recommendation;
+Codex scenes are not locally configured. The selected recommendation supplies
+the lead pair, and `worker_model` / `worker_effort` remain the default pair for
+per-task subagent selection in configured team presets.
+To rank a custom model or alias, add its positive integer tier under
+`model_tiers` in `$XDG_CONFIG_HOME/agent-team/model-levels.json`. Add a
+`model_families` suffix when a provider introduces versioned model names that
+share a family tier. Add a `latest_models` list for other tools when their
+default choices should use a specific newest model per tier. Codex uses the
+newest model per tier from the active CodexRadar cache, with this list as its
+fallback. The original flat `{model: tier}` override format remains accepted.
+When two different models cannot be ranked, team launch or worker spawn fails
+closed.
 Trae scene overrides remain available under `traex.scenes.<scene>` in
 `$XDG_CONFIG_HOME/agent-team/config.json`.
 
@@ -188,12 +229,12 @@ server and mock interactive CLIs; they do not send model requests.
 
 ## Runtime validation and permissions
 
-The resolved preset and worker model/effort are injected into the lead's
-instructions. Native workers must use those values explicitly and report an
-unavailable combination instead of substituting another model. This is a native
-agent instruction, not an API-level model lock; verify actual child session
-metadata in live acceptance runs. Native launches remove inherited AGENT_TEAM_*
-variables so a nested native session does not retain pane-controller identity.
+The resolved preset, lead combined level, allowed model/effort pairs and default
+worker pair are injected into the lead's instructions. Native Codex receives a
+per-task selection policy; its ceiling is instruction-level, not an API-enforced
+lock. Tmux worker requests validate the selected pair against the lead level
+before creating a pane. Native launches remove inherited AGENT_TEAM_* variables
+so a nested native session does not retain pane-controller identity.
 
 For Codex/TraeX pane launches, `-C DIR` / `--cd DIR` are normalized before creating
 the team. The lead, workers and state share that directory. Conflicting worker

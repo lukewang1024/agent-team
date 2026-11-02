@@ -1,0 +1,38 @@
+{
+  "model_tiers": {
+    "gpt-5.6-luna": 1,
+    "gpt-6-luna": 1,
+    "gpt-6.1-terra": 2,
+    "gpt-6-sol": 3,
+    "gpt-6.1-sol": 3,
+    "gpt-6-astra": 4
+  },
+  "model_families": {
+    "luna": 1,
+    "terra": 2,
+    "sol": 3,
+    "astra": 4
+  },
+  "thinking_levels": {
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "xhigh": 4,
+    "max": 5,
+    "ultra": 6
+  },
+  "default_thinking_level": "medium",
+  "latest_models": {
+    "codex": [
+      "gpt-6-luna",
+      "gpt-6.1-terra",
+      "gpt-6.1-sol",
+      "gpt-6-astra"
+    ],
+    "traex": [
+      "gpt-5.6-luna",
+      "gpt-6.1-sol",
+      "gpt-6-astra"
+    ]
+  }
+}

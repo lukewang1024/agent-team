@@ -18,10 +18,16 @@ Lead workflow:
    workers to get around a denial. A host-shell check alone is insufficient.
 1. Write a bounded brief to a UTF-8 file under AGENT_TEAM_DIR (task goal,
    relevant context, file ownership, prerequisites, acceptance criteria).
-2. Run `agent-team spawn <name> --file <brief-path>` to start an interactive
-   worker of the selected coding agent. Names must match `[a-z][a-z0-9_-]{0,39}`
-   and cannot be `lead`; use `worker_a` and `worker_b`, not A/B. At most two
-   worker panes may coexist.
+2. Choose a model and effort pair from the injected
+   `model_policy.allowed_worker_settings` for this brief. Each entry includes its
+   combined level. Use `default_worker_model` and `default_worker_effort` when no
+   different level is needed. Run
+   `agent-team spawn <name> --file <brief-path> --model <model> --effort <effort>`
+   to start an interactive worker. The controller rejects a combined level above
+   the lead's. Defaults use the latest model generation configured for that CLI
+   and tier; Codex uses newer generations from its active CodexRadar cache.
+   Names must match `[a-z][a-z0-9_-]{0,39}` and cannot be `lead`; use
+   `worker_a` and `worker_b`, not A/B. At most two worker panes may coexist.
 3. Continue independent work. Use `agent-team receive` at coordination points,
    or `agent-team wait --timeout 30` when waiting for results. Wait returns
    messages addressed to you, not a promise that a task is complete.
