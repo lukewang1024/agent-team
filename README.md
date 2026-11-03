@@ -79,13 +79,12 @@ The Codex Create Agent menu reads the remote station-recommendation cache. It
 shows the first four distinct categories in the source order and keeps the
 newest model version within each category. Category names and model/effort pairs
 remain remote-driven; the menu limit is configurable in `config/codexradar.json`.
-Codex defaults are used only when no recommendations are available. Fast is
-always off by default and is not read from the recommendation data; enable it
-explicitly with `--fast`.
+Codex defaults are used only when no recommendations are available. Fast follows
+the selected recommendation when the website marks it `+ Fast`. Override it
+with `--no-fast` to save budget or `--fast` to enable it explicitly.
 
 The menu prepares recommendations only when Create Agent → Codex opens. It
-tries the recommendations JSON endpoint first, then parses the homepage's
-Station Picks section if that endpoint is unavailable. It fetches synchronously
+parses the homepage's Station Picks section. It fetches synchronously
 if no valid cache exists. When a valid cache is at least 24 hours old, it
 refreshes in the background and keeps using the active cache; a successful
 refresh is promoted on the next menu open. Direct Codex launches read the cache
@@ -97,6 +96,7 @@ agent-team start codex --recommendation <ID>
 agent-team start codex --recommendation <ID> --team
 agent-team start codex --recommendation <ID> --team --tmux
 agent-team start codex --recommendation <ID> --fast
+agent-team start codex --recommendation <ID> --no-fast
 agent-team start codex --team --dry-run
 ```
 
@@ -104,15 +104,17 @@ Use the `id` from `agent-team recommendations status` when selecting a
 recommendation directly. Cache files live under `$XDG_CACHE_HOME/agent-team`
 (default `~/.cache/agent-team`). If the first fetch fails or returns no usable
 recommendations, the menu shows no hard-coded Codex tiers and still allows
-Codex to start with its native defaults. The empty cache is retried after five
-minutes on a later menu visit. Missing or stale recommendation data never
+Codex to start with its native defaults. A failed refresh is retried after five
+minutes on a later menu visit, while retaining any previous recommendations. Missing or stale recommendation data never
 blocks agent creation.
 
 Trae retains its daily, hard and batch scenes. `--adjust quick` is a Trae-only
 option and selects Astra low. Trae model/effort settings are checked against
 `traex debug models` when requested. CodexRadar recommendations can be checked
 with `agent-team recommendations status` or refreshed manually with
-`agent-team recommendations refresh`.
+`agent-team recommendations refresh`. Press `r` in the interactive Codex
+recommendation picker to refresh immediately, or `f` to toggle Fast off. The
+Workbench Create Agent menu offers the same budget override.
 
 Team defaults to YOLO; `--no-yolo` inherits CLI permissions for the entire team.
 Single inherits CLI permissions unless the caller explicitly opts in. Existing

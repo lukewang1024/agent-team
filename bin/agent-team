@@ -68,10 +68,6 @@ def codex_radar_options():
     url = options.get("url")
     if not isinstance(url, str) or not url.startswith("https://"):
         fail("Codex Radar URL must use HTTPS")
-    html_fallback_url = options.get("html_fallback_url")
-    if html_fallback_url is not None and (
-            not isinstance(html_fallback_url, str) or not html_fallback_url.startswith("https://")):
-        fail("Codex Radar html_fallback_url must use HTTPS")
     interval = options.get("refresh_interval_seconds", 86400)
     if type(interval) not in (int, float) or interval < 60:
         fail("Codex Radar refresh_interval_seconds must be at least 60")
@@ -101,66 +97,31 @@ def codex_radar_url_label(url):
     return urllib.parse.urlunsplit((parsed.scheme, host, parsed.path, "", ""))
 
 
-def normalize_codex_radar(data, options):
-    if not isinstance(data, dict) or data.get("ok") is False:
-        fail("Codex Radar returned an invalid recommendations document")
-    if "schema" in data and data["schema"] != 1:
-        fail("Codex Radar returned an unsupported recommendations schema")
-    recommendations = data.get("recommendations")
-    if not isinstance(recommendations, list):
-        fail("Codex Radar response has no recommendations list")
-
-    normalized = {"items": []}
-    for record_index, recommendation in enumerate(recommendations):
-        if not isinstance(recommendation, dict):
-            continue
-        source_key = next((recommendation[key].strip() for key in
-                           ("key", "scene", "scene_key", "category", "id", "slug")
-                           if isinstance(recommendation.get(key), str) and recommendation[key].strip()), None)
-        source_label = next((recommendation[key].strip() for key in
-                             ("title", "name", "label", "display_name", "scene_name", "category_name")
-                             if isinstance(recommendation.get(key), str) and recommendation[key].strip()), None)
-        source_key = source_key or source_label or ("recommendation-" + str(record_index + 1))
-        source_label = source_label or re.sub(r"[_-]+", " ", source_key).strip()
-        source_label = "".join(character for character in source_label
-                               if character.isprintable() and character != "#").strip()[:80]
-        if not source_label:
-            source_label = "CodexRadar recommendation " + str(record_index + 1)
-        items = recommendation.get("items")
-        if isinstance(items, list):
-            candidates = items
-        elif isinstance(items, dict):
-            candidates = [items]
-        else:
-            candidate = recommendation.get("recommendation", recommendation)
-            candidates = candidate if isinstance(candidate, list) else [candidate]
-        source_id = re.sub(r"[^A-Za-z0-9._-]+", "-", source_key.lower()).strip("-._")[:64]
-        if not source_id:
-            source_id = "recommendation-" + hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:12]
-        for item in candidates:
-            if not isinstance(item, dict):
+def normalize_codex_radar(recommendations):
+    items = []
+    for recommendation in recommendations:
+        source_key = recommendation["key"]
+        label = "".join(character for character in recommendation["title"]
+                        if character.isprintable() and character != "#").strip()[:80]
+        for item in recommendation["items"]:
+            raw_model = item["model"]
+            raw_effort = item["effort"]
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,63}", raw_model):
                 continue
-            model = item.get("model", item.get("model_id"))
-            effort = item.get("effort", item.get("reasoning_effort", item.get("reasoning_level")))
-            if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,63}", model.strip()):
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_ -]{0,23}", raw_effort):
                 continue
-            if not isinstance(effort, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_ -]{0,23}", effort.strip()):
-                continue
-            raw_model = model.strip()
-            raw_effort = effort.strip()
             model_id = re.sub(r"\s+", "-", raw_model.lower())
             effort_id = re.sub(r"[\s_-]+", "", raw_effort.lower())
             stable_suffix = hashlib.sha256((source_key + "\0" + model_id + "\0" + effort_id).encode("utf-8")).hexdigest()[:10]
-            normalized["items"].append({
-                "id": source_id + "-" + stable_suffix,
+            items.append({
+                "id": source_key + "-" + stable_suffix,
                 "source_key": source_key,
-                "label": source_label + " · " + raw_model + " " + raw_effort,
+                "label": label + " · " + raw_model + " " + raw_effort + (" + Fast" if item["fast"] else ""),
                 "model": model_id,
                 "effort": effort_id,
+                "fast": item["fast"],
             })
-    if recommendations and not normalized["items"]:
-        fail("Codex Radar response contains no usable model/effort recommendations")
-    return normalized
+    return {"items": items}
 
 
 class CodexRadarHTMLParser(HTMLParser):
@@ -229,6 +190,7 @@ def normalize_codex_radar_html(document, options):
     parser = CodexRadarHTMLParser()
     parser.feed(document)
     parser.close()
+    parser.flush_text()
 
     section_level = None
     scene_level = None
@@ -272,9 +234,10 @@ def normalize_codex_radar_html(document, options):
         items = []
         seen = set()
         for line in text.splitlines():
-            line = re.sub(r"(?i)(?:\s*[+＋]\s*|\s+)(?:fast|ultrafast)\b", " ", line)
             line = line.strip(" \t\n.,;:|/()[]{}·")
             for segment in re.split(r"\s*(?:/|·|;|；|\||,|，)\s*", line):
+                fast = bool(re.search(r"(?i)(?:\s*[+＋]\s*|\s+)fast\b", segment))
+                segment = re.sub(r"(?i)(?:\s*[+＋]\s*|\s+)(?:fast|ultrafast)\b", " ", segment)
                 match = model_effort_pattern.fullmatch(segment.strip())
                 if not match:
                     continue
@@ -288,17 +251,21 @@ def normalize_codex_radar_html(document, options):
                 if identity in seen:
                     continue
                 seen.add(identity)
-                items.append({"model": model, "effort": effort})
+                items.append({"model": model, "effort": effort, "fast": fast})
         if not items:
             continue
         key = re.sub(r"[^a-z0-9]+", "_", scene["title"].lower()).strip("_")
+        key = key[:64].strip("_")
         if not key:
             key = "scene-" + hashlib.sha256(scene["title"].encode("utf-8")).hexdigest()[:12]
         raw_recommendations.append({"key": key, "title": scene["title"], "items": items})
 
     if not raw_recommendations:
         fail("Codex Radar homepage Station Picks contained no recognizable model/effort values")
-    return normalize_codex_radar({"recommendations": raw_recommendations}, options)
+    normalized = normalize_codex_radar(raw_recommendations)
+    if not normalized["items"]:
+        fail("Codex Radar homepage Station Picks contained no usable model/effort values")
+    return normalized
 
 
 def read_codex_radar_cache(path=None):
@@ -318,6 +285,12 @@ def read_codex_radar_cache(path=None):
         cache["recommendations"] = {"items": []}
     if cache.get("version") != 2:
         return None
+    if (cache.get("source_url") == "https://codexradar.com/api/radar-insights"
+            and cache.get("source_format") == "html"
+            and cache.get("fetched_from_url") == "https://codexradar.com/"):
+        cache["source_url"] = cache["fetched_from_url"]
+        cache["last_attempt_url"] = cache["fetched_from_url"]
+        cache.pop("source_warning", None)
     if not isinstance(cache.get("recommendations"), dict):
         return None
     return cache
@@ -334,9 +307,9 @@ def codex_radar_fetch(opener, url, accept):
         },
     )
     with opener.open(request, timeout=4) as response:
-        body = response.read(2 * 1024 * 1024 + 1)
-    if len(body) > 2 * 1024 * 1024:
-        fail("Codex Radar response exceeds the 2 MiB limit")
+        body = response.read(8 * 1024 * 1024 + 1)
+    if len(body) > 8 * 1024 * 1024:
+        fail("Codex Radar response exceeds the 8 MiB limit")
     return body
 
 
@@ -372,34 +345,11 @@ def update_codex_radar_recommendations(force=False, strict=False, target="active
         for scheme in ("http", "https")
     }
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({k: v for k, v in proxies.items() if v}))
-    fetch_errors = []
-    payload = None
-    fetched_url = options["url"]
-    source_format = "json"
-    source_warning = None
     try:
-        body = codex_radar_fetch(opener, options["url"], "application/json")
-        payload = json.loads(body.decode("utf-8"))
-        recommendations = normalize_codex_radar(payload, options)
-        if not recommendations["items"] and options.get("html_fallback_url"):
-            fail("Codex Radar recommendations endpoint returned no recommendations")
-    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, UnicodeError, ValueError, TypeError, KeyError, RuntimeError) as primary_error:
-        fetch_errors.append((options["url"], primary_error))
-        fallback_url = options.get("html_fallback_url")
-        if isinstance(fallback_url, str) and fallback_url != options["url"]:
-            try:
-                body = codex_radar_fetch(opener, fallback_url, "text/html,application/xhtml+xml")
-                document = body.decode("utf-8")
-                recommendations = normalize_codex_radar_html(document, options)
-                fetched_url = fallback_url
-                payload = {}
-                source_format = "html"
-                source_warning = codex_radar_error_detail(options["url"], primary_error)
-            except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, UnicodeError, ValueError, TypeError, KeyError, RuntimeError) as fallback_error:
-                fetch_errors.append((fallback_url, fallback_error))
-
-    if fetch_errors and not source_warning:
-        error_summary = "; ".join(codex_radar_error_detail(url, error) for url, error in fetch_errors)
+        body = codex_radar_fetch(opener, options["url"], "text/html,application/xhtml+xml")
+        recommendations = normalize_codex_radar_html(body.decode("utf-8"), options)
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, UnicodeError, ValueError, TypeError, KeyError, RuntimeError) as error:
+        error_summary = codex_radar_error_detail(options["url"], error)
         if strict:
             fail("CodexRadar refresh failed: " + error_summary)
         if cache is None:
@@ -413,8 +363,7 @@ def update_codex_radar_recommendations(force=False, strict=False, target="active
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             write(cache_path, cache)
         except OSError:
-            if strict:
-                raise
+            pass
         return cache, False
 
     cache = {
@@ -422,11 +371,10 @@ def update_codex_radar_recommendations(force=False, strict=False, target="active
         "source_url": options["url"],
         "last_attempt_url": options["url"],
         "fetched_at": now,
-        "source_updated_at": payload.get("generated_at") or payload.get("updated_at"),
+        "source_updated_at": None,
         "last_attempt_at": now,
-        "fetched_from_url": fetched_url,
-        "source_format": source_format,
-        "source_warning": source_warning,
+        "fetched_from_url": options["url"],
+        "source_format": "html",
         "recommendations": recommendations,
     }
     try:
@@ -551,8 +499,11 @@ def prepare_codex_radar_for_menu():
         last_attempt = 0
     has_data = codex_radar_has_data(cache)
     interval = options.get("refresh_interval_seconds", 86400)
-    retry_interval = interval if has_data else options.get("failure_retry_interval_seconds", 300)
-    if time.time() - last_attempt >= retry_interval:
+    retry_interval = (options.get("failure_retry_interval_seconds", 300)
+                      if not has_data or cache.get("last_error") else interval)
+    missing_fast = has_data and any(not isinstance(item.get("fast"), bool)
+                                    for item in cache["recommendations"]["items"] if isinstance(item, dict))
+    if (missing_fast and not cache.get("last_error")) or time.time() - last_attempt >= retry_interval:
         if has_data:
             start_codex_radar_background_refresh()
         else:
@@ -563,6 +514,9 @@ def prepare_codex_radar_for_menu():
 def apply_codex_radar_recommendation(target, recommendation, key, updated_at, team_roles=True):
     target["model"] = recommendation["model"]
     target["effort"] = recommendation["effort"]
+    if isinstance(recommendation.get("fast"), bool):
+        target["fast"] = recommendation["fast"]
+        target["fast_explicit"] = True
     if team_roles:
         target["worker_model"] = recommendation["model"]
         target["worker_effort"] = recommendation["effort"]
@@ -2158,17 +2112,36 @@ def main():
         tool = available[int(choice) - 1]
         if tool == "codex":
             CODEX_RADAR_MENU_CACHE = prepare_codex_radar_for_menu()
-            recommendations = codex_radar_menu_items(CODEX_RADAR_MENU_CACHE)
-            if recommendations:
+            no_fast = False
+            while True:
+                recommendations = codex_radar_menu_items(CODEX_RADAR_MENU_CACHE)
                 for number, item in enumerate(recommendations, 1):
                     print(f"{number}. {item['label']}")
-                choice = input("CodexRadar recommendation [1]: ").strip() or "1"
-                if not choice.isdigit() or not 1 <= int(choice) <= len(recommendations):
-                    fail("Invalid recommendation selection")
-                flags = ["--recommendation", recommendations[int(choice) - 1]["id"]]
-            else:
-                print("CodexRadar recommendations unavailable; using Codex defaults.")
-                flags = []
+                if not recommendations:
+                    print("CodexRadar recommendations unavailable; using Codex defaults.")
+                choice = input("CodexRadar recommendation [1] (r: refresh, f: toggle Fast off): ").strip() or "1"
+                if choice.lower() == "f":
+                    no_fast = not no_fast
+                    print("Fast: " + ("off" if no_fast else "follow recommendation"))
+                    continue
+                if choice.lower() == "r":
+                    try:
+                        CODEX_RADAR_MENU_CACHE, _ = update_codex_radar_recommendations(force=True, strict=True)
+                        print("CodexRadar recommendations refreshed.")
+                    except (RuntimeError, OSError) as error:
+                        print("CodexRadar refresh failed: " + str(error), file=sys.stderr)
+                    continue
+                if recommendations:
+                    if not choice.isdigit() or not 1 <= int(choice) <= len(recommendations):
+                        fail("Invalid recommendation selection")
+                    flags = ["--recommendation", recommendations[int(choice) - 1]["id"]]
+                else:
+                    if choice != "1":
+                        fail("Invalid recommendation selection")
+                    flags = []
+                if no_fast:
+                    flags.append("--no-fast")
+                break
             team = input("模式: 1. Single  2. Team [1]: ").strip() or "1"
             if team not in ("1", "2"):
                 fail("Invalid mode selection")

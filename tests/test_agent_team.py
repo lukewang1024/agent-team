@@ -317,6 +317,36 @@ class AdapterTests(unittest.TestCase):
         launch.assert_called_once_with(
             ['--recommendation', 'blue-team-1234567890', '--team'], tool='codex')
 
+    def test_picker_refresh_replaces_displayed_recommendation(self):
+        url = TEAM.codex_radar_options()['url']
+        def cache(model):
+            return {'version': 2, 'source_url': url, 'recommendations': {'items': [{
+                'id': model, 'source_key': 'daily', 'label': model,
+                'model': model, 'effort': 'max'}]}}
+        with patch.object(TEAM.sys, 'argv', ['agent-team']), \
+                patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \
+                patch.object(TEAM.shutil, 'which', side_effect=lambda name: '/bin/tool' if name == 'codex' else None), \
+                patch('builtins.input', side_effect=['1', 'r', '1', '1']), \
+                patch.object(TEAM, 'prepare_codex_radar_for_menu', return_value=cache('old-1')), \
+                patch.object(TEAM, 'update_codex_radar_recommendations', return_value=(cache('new-2'), True)) as refresh, \
+                patch.object(TEAM, 'start_codex') as launch, contextlib.redirect_stdout(io.StringIO()):
+            TEAM.main()
+        refresh.assert_called_once_with(force=True, strict=True)
+        launch.assert_called_once_with(['--recommendation', 'new-2'], tool='codex')
+
+    def test_picker_can_turn_off_recommended_fast(self):
+        cache = {'source_url': TEAM.codex_radar_options()['url'], 'recommendations': {'items': [{
+            'id': 'daily-123', 'source_key': 'daily', 'label': 'daily + Fast',
+            'model': 'gpt-6.1-terra', 'effort': 'max', 'fast': True}]}}
+        with patch.object(TEAM.sys, 'argv', ['agent-team']), \
+                patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \
+                patch.object(TEAM.shutil, 'which', side_effect=lambda name: '/bin/tool' if name == 'codex' else None), \
+                patch('builtins.input', side_effect=['1', 'f', '1', '1']), \
+                patch.object(TEAM, 'prepare_codex_radar_for_menu', return_value=cache), \
+                patch.object(TEAM, 'start_codex') as launch, contextlib.redirect_stdout(io.StringIO()):
+            TEAM.main()
+        launch.assert_called_once_with(['--recommendation', 'daily-123', '--no-fast'], tool='codex')
+
     def test_picker_keeps_trae_scene_selection(self):
         with patch.object(TEAM.sys, 'argv', ['agent-team']), \
                 patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \
@@ -435,63 +465,53 @@ class AdapterTests(unittest.TestCase):
                 self.assertNotIn('-m', plan['argv'])
                 self.assertFalse(any('model_reasoning_effort=' in arg for arg in plan['argv']))
 
-    def test_codex_radar_payload_keeps_dynamic_categories_and_all_model_choices(self):
-        options = TEAM.codex_radar_options()
-        payload = {
-            'schema': 1,
-            'updated_at': '2026-11-01T00:00:00Z',
-            'recommendations': [
-                {'scene': 'daily_development', 'title': '日常开发', 'items': [
-                    {'model': 'GPT-6.1 Sol', 'effort': 'High', 'fast': True},
-                ]},
-                {'category': 'background_automation', 'title': '后台自动化', 'items': [
-                    {'model': 'GPT-5.6 Luna', 'reasoning_effort': 'Max'},
-                    {'model': 'GPT-6 Luna', 'reasoning_effort': 'Max'},
-                ]},
-                {'key': 'blue_team', 'label': '蓝队任务',
-                 'model': 'GPT-5.6 Sol', 'reasoning_effort': 'X High'},
-            ],
-            'alerts': [],
-        }
-        normalized = TEAM.normalize_codex_radar(payload, options)
+    def test_codex_radar_html_keeps_dynamic_categories_and_model_choices(self):
+        document = """<h2>站长推荐</h2>
+          <h3>日常开发</h3><p>GPT-6.1 Terra Max + Fast</p>
+          <h3>后台自动化</h3><p>GPT-5.6 Luna max + Fast / GPT-6 Luna max</p>
+          <h3>蓝队任务</h3><p>GPT-5.6 Sol xhigh</p><h2>其他</h2>"""
+        normalized = TEAM.normalize_codex_radar_html(document, TEAM.codex_radar_options())
         items = normalized['items']
-        self.assertEqual(len(items), 4)
-        self.assertEqual(items[0]['model'], 'gpt-6.1-sol')
-        self.assertEqual(items[0]['effort'], 'high')
-        self.assertEqual(items[1]['model'], 'gpt-5.6-luna')
-        self.assertEqual(items[2]['model'], 'gpt-6-luna')
-        self.assertEqual(items[3]['effort'], 'xhigh')
+        self.assertEqual([(x['model'], x['effort']) for x in items], [
+            ('gpt-6.1-terra', 'max'), ('gpt-5.6-luna', 'max'),
+            ('gpt-6-luna', 'max'), ('gpt-5.6-sol', 'xhigh')])
         self.assertEqual(len({item['id'] for item in items}), 4)
-        self.assertTrue(all('fast' not in item for item in items))
-        self.assertEqual(TEAM.normalize_codex_radar(
-            {'schema': 1, 'recommendations': [], 'alerts': []}, options), {'items': []})
-        with self.assertRaisesRegex(RuntimeError, 'unsupported.*schema'):
-            TEAM.normalize_codex_radar({'schema': 2, 'recommendations': []}, options)
-
-        cache = {'source_url': options['url'], 'recommendations': normalized}
+        self.assertEqual([item['fast'] for item in items], [True, True, False, False])
+        self.assertTrue(items[0]['label'].endswith(' + Fast'))
+        cache = {'source_url': TEAM.codex_radar_options()['url'], 'recommendations': normalized}
         selected = TEAM.codex_settings(items[2]['id'], team=True, cache=cache)
-        self.assertEqual(selected['model'], 'gpt-6-luna')
-        self.assertEqual(selected['worker_model'], 'gpt-6-luna')
-        self.assertEqual(selected['worker_effort'], 'max')
+        self.assertEqual((selected['model'], selected['worker_model'], selected['worker_effort']),
+                         ('gpt-6-luna', 'gpt-6-luna', 'max'))
         self.assertFalse(selected['fast'])
-        fallback = TEAM.codex_settings('absent-id', team=True, cache=cache)
-        self.assertNotIn('model', fallback)
-        self.assertNotIn('worker_model', fallback)
+        self.assertTrue(selected['fast_explicit'])
+
+    def test_recommended_fast_propagates_and_can_be_overridden(self):
+        document = "<h2>站长推荐</h2><h3>日常开发</h3><p>GPT-6.1 Terra Max + Fast</p>"
+        items = TEAM.normalize_codex_radar_html(document, TEAM.codex_radar_options())['items']
+        cache = {'version': 2, 'source_url': TEAM.codex_radar_options()['url'],
+                 'recommendations': {'items': items}}
+        for team in (False, True):
+            for override, expected in (([], 'fast'), (['--no-fast'], 'default')):
+                with self.subTest(team=team, override=override), \
+                        patch.object(TEAM, 'CODEX_RADAR_RUNTIME', True), \
+                        patch.object(TEAM, 'CODEX_RADAR_MENU_CACHE', cache), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    TEAM.start_codex(['--recommendation', items[0]['id'], '--dry-run'] +
+                                     (['--team'] if team else []) + override)
+                plan = json.loads(output.getvalue())
+                self.assertEqual(plan['config']['fast'], expected == 'fast')
+                self.assertIn('service_tier="' + expected + '"', plan['argv'])
+                if team:
+                    worker, _ = TEAM.command('codex', plan['config'], 'tmux', worker=True)
+                    self.assertIn('service_tier="' + expected + '"', worker)
+
     def test_codex_radar_refresh_fetches_and_caches_dynamic_recommendations(self):
-        payload = {
-            'schema': 1,
-            'updated_at': '2026-11-01T00:00:00Z',
-            'recommendations': [{
-                'scene': 'daily_development', 'title': '日常开发',
-                'items': [{'model': 'GPT-6.1 Sol', 'effort': 'High', 'fast': True}],
-            }],
-            'alerts': [],
-        }
+        document = "<h2>站长推荐</h2><h3>日常开发</h3><p>GPT-6.1 Terra Max + Fast</p>"
 
         class Response:
             def __enter__(self): return self
             def __exit__(self, *_): return False
-            def read(self, _limit): return json.dumps(payload).encode()
+            def read(self, _limit): return document.encode()
 
         class Opener:
             def __init__(self): self.request = None
@@ -506,15 +526,30 @@ class AdapterTests(unittest.TestCase):
             with patch.object(TEAM.urllib.request, 'build_opener', return_value=opener):
                 cache, updated = TEAM.update_codex_radar_recommendations(force=True)
             self.assertTrue(updated)
-            self.assertEqual(opener.request.full_url, 'https://codexradar.com/api/radar-insights')
+            self.assertEqual(opener.request.full_url, 'https://codexradar.com/')
             self.assertEqual(opener.request.get_header('Origin'), 'https://codexradar.com')
             self.assertEqual(cache['version'], 2)
             item = cache['recommendations']['items'][0]
-            self.assertEqual(item['model'], 'gpt-6.1-sol')
-            self.assertEqual(item['effort'], 'high')
-            self.assertNotIn('fast', item)
+            self.assertEqual(item['model'], 'gpt-6.1-terra')
+            self.assertEqual(item['effort'], 'max')
+            self.assertTrue(item['fast'])
             saved = TEAM.read_codex_radar_cache()
-            self.assertEqual(saved['recommendations']['items'][0]['effort'], 'high')
+            self.assertEqual(saved['recommendations']['items'][0]['effort'], 'max')
+
+    def test_old_html_cache_migrates_and_survives_failed_refresh(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                'XDG_CACHE_HOME': directory, 'XDG_CONFIG_HOME': str(Path(directory) / 'config')}):
+            path = TEAM.codex_radar_cache_path()
+            path.parent.mkdir(parents=True)
+            TEAM.write(path, {'version': 2, 'source_url': 'https://codexradar.com/api/radar-insights',
+                'fetched_from_url': 'https://codexradar.com/', 'source_format': 'html',
+                'fetched_at': 42, 'recommendations': {'items': [{'model': 'old-model'}]}})
+            with patch.object(TEAM, 'codex_radar_fetch', side_effect=OSError('offline')):
+                cache, updated = TEAM.update_codex_radar_recommendations(force=True)
+            self.assertFalse(updated)
+            self.assertEqual(cache['source_url'], 'https://codexradar.com/')
+            self.assertEqual(cache['recommendations']['items'][0]['model'], 'old-model')
+            self.assertIn('last_error', cache)
 
     def test_legacy_scene_cache_migrates_to_empty_remote_recommendations(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -547,6 +582,23 @@ class AdapterTests(unittest.TestCase):
         status = json.loads(output.getvalue())
         self.assertEqual(status['last_error'], 'HTTPError:404')
         self.assertEqual(status['last_error_endpoint'], endpoint)
+    def test_cache_without_fast_metadata_is_refreshed_without_waiting_a_day(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                'XDG_CACHE_HOME': directory, 'XDG_CONFIG_HOME': str(Path(directory) / 'config')}):
+            path = TEAM.codex_radar_cache_path()
+            path.parent.mkdir(parents=True)
+            cache = {'version': 2, 'source_url': TEAM.codex_radar_options()['url'],
+                     'last_attempt_at': time.time(), 'recommendations': {'items': [{'model': 'old'}]}}
+            TEAM.write(path, cache)
+            with patch.object(TEAM, 'start_codex_radar_background_refresh', return_value=True) as start:
+                self.assertEqual(TEAM.prepare_codex_radar_for_menu(), cache)
+                start.assert_called_once()
+            cache['last_error'] = 'offline'
+            TEAM.write(path, cache)
+            with patch.object(TEAM, 'start_codex_radar_background_refresh') as start:
+                TEAM.prepare_codex_radar_for_menu()
+                start.assert_not_called()
+
     def test_codex_radar_refresh_is_staged_and_empty_cache_retries_quickly(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
                 'XDG_CACHE_HOME': directory, 'XDG_CONFIG_HOME': str(Path(directory) / 'config')}):
@@ -577,9 +629,15 @@ class AdapterTests(unittest.TestCase):
                 'last_attempt_at': time.time(),
                 'recommendations': {'items': [{
                     'id': 'daily-2222222222', 'source_key': 'daily_development',
-                    'label': '日常开发 · new-model high', 'model': 'new-model', 'effort': 'high'
+                    'label': '日常开发 · new-model high', 'model': 'new-model', 'effort': 'high', 'fast': False
                 }]},
             }
+            failed_with_data = dict(old, last_attempt_at=time.time() - 301, last_error='network error')
+            TEAM.write(TEAM.codex_radar_cache_path(), failed_with_data)
+            with patch.object(TEAM, 'start_codex_radar_background_refresh', return_value=True) as start:
+                self.assertEqual(TEAM.prepare_codex_radar_for_menu()['last_error'], 'network error')
+                start.assert_called_once()
+
             TEAM.write(TEAM.codex_radar_pending_cache_path(), new)
             active = TEAM.prepare_codex_radar_for_menu()
             self.assertEqual(active['recommendations']['items'][0]['model'], 'new-model')
