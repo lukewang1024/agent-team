@@ -347,6 +347,17 @@ class AdapterTests(unittest.TestCase):
             TEAM.main()
         launch.assert_called_once_with(['--recommendation', 'daily-123', '--no-fast'], tool='codex')
 
+    def test_picker_shows_all_presets_and_honors_optional_limit(self):
+        cache = {'source_url': TEAM.codex_radar_options()['url'], 'recommendations': {'items': [
+            {'id': f'pick-{i}', 'source_key': f'scene-{i}', 'label': f'Scene {i}',
+             'model': 'gpt-6', 'effort': 'high'} for i in range(6)]}}
+        self.assertEqual(len(TEAM.codex_radar_menu_items(cache)), 6)
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'XDG_CONFIG_HOME': directory}):
+            path = Path(directory) / 'agent-team/config.json'
+            path.parent.mkdir()
+            path.write_text(json.dumps({'codex_radar': {'menu_category_limit': 3}}))
+            self.assertEqual(len(TEAM.codex_radar_menu_items(cache)), 3)
+
     def test_picker_keeps_trae_scene_selection(self):
         with patch.object(TEAM.sys, 'argv', ['agent-team']), \
                 patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \

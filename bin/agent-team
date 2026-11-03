@@ -74,8 +74,8 @@ def codex_radar_options():
     failure_interval = options.get("failure_retry_interval_seconds", 300)
     if type(failure_interval) not in (int, float) or failure_interval < 60:
         fail("Codex Radar failure_retry_interval_seconds must be at least 60")
-    menu_category_limit = options.get("menu_category_limit", 4)
-    if type(menu_category_limit) is not int or menu_category_limit < 1:
+    menu_category_limit = options.get("menu_category_limit")
+    if menu_category_limit is not None and (type(menu_category_limit) is not int or menu_category_limit < 1):
         fail("Codex Radar menu_category_limit must be a positive integer")
     return options
 
@@ -893,7 +893,7 @@ def codex_radar_items(cache=None):
 def codex_radar_menu_items(cache=None):
     items = codex_radar_items(cache)
     try:
-        limit = codex_radar_options().get("menu_category_limit", 4)
+        limit = codex_radar_options().get("menu_category_limit")
     except (OSError, ValueError, TypeError, KeyError, RuntimeError):
         return []
     categories = {}
@@ -2118,8 +2118,8 @@ def main():
                 for number, item in enumerate(recommendations, 1):
                     print(f"{number}. {item['label']}")
                 if not recommendations:
-                    print("CodexRadar recommendations unavailable; using Codex defaults.")
-                choice = input("CodexRadar recommendation [1] (r: refresh, f: toggle Fast off): ").strip() or "1"
+                    print("Presets unavailable; using Codex defaults.")
+                choice = input("Preset [1] (r: refresh, f: toggle Fast off): ").strip() or "1"
                 if choice.lower() == "f":
                     no_fast = not no_fast
                     print("Fast: " + ("off" if no_fast else "follow recommendation"))
@@ -2127,9 +2127,9 @@ def main():
                 if choice.lower() == "r":
                     try:
                         CODEX_RADAR_MENU_CACHE, _ = update_codex_radar_recommendations(force=True, strict=True)
-                        print("CodexRadar recommendations refreshed.")
+                        print("Presets refreshed.")
                     except (RuntimeError, OSError) as error:
-                        print("CodexRadar refresh failed: " + str(error), file=sys.stderr)
+                        print("Preset refresh failed: " + str(error), file=sys.stderr)
                     continue
                 if recommendations:
                     if not choice.isdigit() or not 1 <= int(choice) <= len(recommendations):

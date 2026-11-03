@@ -76,9 +76,9 @@ against `traex debug models` without making an inference request.
 ## CodexRadar recommendations
 
 The Codex Create Agent menu reads the remote station-recommendation cache. It
-shows the first four distinct categories in the source order and keeps the
-newest model version within each category. Category names and model/effort pairs
-remain remote-driven; the menu limit is configurable in `config/codexradar.json`.
+shows all distinct categories in the source order and keeps the newest model
+version within each category. Category names and model/effort pairs remain
+remote-driven; an optional `menu_category_limit` can limit the CLI picker.
 Codex defaults are used only when no recommendations are available. Fast follows
 the selected recommendation when the website marks it `+ Fast`. Override it
 with `--no-fast` to save budget or `--fast` to enable it explicitly.
