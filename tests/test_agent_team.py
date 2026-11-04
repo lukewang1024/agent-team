@@ -371,7 +371,7 @@ class AdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_dir = Path(directory) / 'missing-config'
             config_dir.mkdir()
-            for name in ('team-rules.md', 'team-pane.md'):
+            for name in ('team-rules.md', 'team-pane.md', 'model-levels.json'):
                 shutil.copy2(ROOT / 'config' / name, config_dir / name)
             with patch.object(TEAM, 'CONFIG', config_dir), patch.dict(os.environ, {
                     'CODEX_HOME': directory, 'XDG_CONFIG_HOME': str(Path(directory) / 'xdg')}):
@@ -741,7 +741,10 @@ class PaneTests(unittest.TestCase):
         for role in ('lead', 'worker_a'):
             args = json.loads((self.directory / (role+'-argv.json')).read_text())
             self.assertNotIn('-m', args)
-            self.assertFalse(any('model_reasoning_effort=' in arg for arg in args))
+            efforts = [arg for arg in args if arg.startswith('model_reasoning_effort=')]
+            expected = [] if role == 'lead' else [
+                'model_reasoning_effort=' + json.dumps(TEAM.model_policy_config()['default_thinking_level'])]
+            self.assertEqual(efforts, expected)
             self.assertFalse(any('service_tier=' in arg for arg in args))
         self.assertIsNone(self.state()['config']['recommendation_id'])
     def test_interactive_layout_cap_mailbox_reuse_and_stop(self):
@@ -771,6 +774,52 @@ class PaneTests(unittest.TestCase):
         self.assertEqual(len(self.state()['members']), 3)
         self.control('stop', 'two')
         self.assertEqual(self.state()['members']['two']['status'], 'stopped')
+
+    def test_sidebar_is_preserved_during_spawn_and_stop(self):
+        state = self.state()
+        cmd = [self.real_tmux, '-L', self.socket]
+        lead = state['members']['lead']['pane']
+        sidebar = subprocess.check_output(cmd + ['split-window', '-d', '-b', '-h', '-l', '25',
+                                          '-t', lead, '-P', '-F', '#{pane_id}', 'sleep 300'], text=True).strip()
+        subprocess.run(cmd + ['set-option', '-p', '-t', sidebar, '@pane_role', 'sidebar'], check=True)
+
+        def positions():
+            rows = subprocess.check_output(cmd + ['list-panes', '-t', state['window'], '-F',
+                '#{pane_id} #{pane_left} #{pane_top} #{pane_width}'], text=True).splitlines()
+            return {pane: tuple(map(int, (left, top, width)))
+                    for pane, left, top, width in (row.split() for row in rows)}
+
+        for name in ('one', 'two'):
+            self.spawn(name)
+            pos = positions()
+            self.assertEqual(pos[sidebar][0::2], (0, 25))
+            self.assertLess(pos[lead][0], pos[self.state()['members'][name]['pane']][0])
+        pos = positions()
+        one, two = (state['pane'] for name, state in self.state()['members'].items() if name != 'lead')
+        self.assertEqual(pos[one][0], pos[two][0])
+        self.assertNotEqual(pos[one][1], pos[two][1])
+        self.control('stop', 'two')
+        pos = positions()
+        self.assertEqual(pos[sidebar][0::2], (0, 25))
+        self.assertLess(pos[lead][0], pos[one][0])
+        self.control('stop', 'one')
+        self.assertEqual(positions()[sidebar][0::2], (0, 25))
+
+    def test_right_sidebar_keeps_position_and_width(self):
+        state = self.state()
+        cmd = [self.real_tmux, '-L', self.socket]
+        lead = state['members']['lead']['pane']
+        sidebar = subprocess.check_output(cmd + ['split-window', '-d', '-h', '-l', '24',
+                                          '-t', lead, '-P', '-F', '#{pane_id}', 'sleep 300'], text=True).strip()
+        subprocess.run(cmd + ['set-option', '-p', '-t', sidebar, '@pane_role', 'sidebar'], check=True)
+        self.spawn('one')
+        self.spawn('two')
+        rows = subprocess.check_output(cmd + ['list-panes', '-t', state['window'], '-F',
+            '#{pane_id} #{pane_left} #{pane_width}'], text=True).splitlines()
+        pos = {pane: (int(left), int(width)) for pane, left, width in (row.split() for row in rows)}
+        self.assertEqual(pos[sidebar][1], 24)
+        self.assertGreater(pos[sidebar][0], max(pos[pane][0] for pane in pos if pane != sidebar))
+        self.assertLess(pos[lead][0], pos[self.state()['members']['one']['pane']][0])
 
     def test_role_prefix_survives_application_title_updates(self):
         self.spawn('one')

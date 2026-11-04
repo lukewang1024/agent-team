@@ -1495,7 +1495,29 @@ def owned(state, pane):
 
 
 def layout(state):
-    tmux("select-layout", "-t", state["window"], "main-vertical")
+    window = state["window"]
+    sidebar = tmux("list-panes", "-t", window, "-f", "#{==:#{@pane_role},sidebar}",
+                   "-F", "#{pane_id}").splitlines()
+    if not sidebar:
+        tmux("select-layout", "-t", window, "main-vertical")
+        return
+    sidebar = sidebar[0]
+    width, left = map(int, tmux("display-message", "-p", "-t", sidebar,
+                                "#{pane_width} #{pane_left}").split())
+    active = tmux("display-message", "-p", "-t", window, "#{pane_id}")
+    tmux("break-pane", "-d", "-s", sidebar)
+    try:
+        tmux("select-layout", "-t", window, "main-vertical")
+    finally:
+        args = ["join-pane", "-f", "-h"]
+        if left == 0:
+            args.append("-b")
+        try:
+            tmux(*args, "-l", str(width), "-s", sidebar, "-t", window)
+        except RuntimeError:
+            # A concurrent resize may make the original width impossible.
+            tmux(*args, "-s", sidebar, "-t", window)
+        tmux("select-pane", "-t", active, check=False)
 
 
 def runner(directory, name):
