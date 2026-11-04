@@ -121,8 +121,9 @@ and argv without starting a model session.
 
 Native mode uses each tool's own delegation: Codex/TraeX agent configuration,
 Claude's team-worker subagent definition, or OpenCode's team-worker definition.
-The collaboration policy has a two-worker limit; Codex also receives a
-configuration cap. TraeX/Claude/OpenCode's native cap is instruction-level. In tmux
+The default limit is four concurrent workers; Codex also receives a
+configuration cap. Use fewer when work cannot be usefully parallelized.
+TraeX/Claude/OpenCode's native cap is instruction-level. In tmux
 mode the controller enforces the pane cap and disables native delegation.
 
 Tmux mode creates one dedicated window (or a new session when outside tmux).
@@ -189,8 +190,9 @@ tiers to `$XDG_CONFIG_HOME/agent-team/model-levels.json`:
 Thinking ranks come from the built-in policy unless overridden. The combined
 worker level must not exceed the lead's model tier and thinking rank.
 
-Supported team keys: `model`, `effort`, `worker_model`, `worker_effort`, `limit` (1 or
-2), `yolo` (boolean, default true), `args`, `worker_args` (CLI argument arrays),
+Supported team keys: `model`, `effort`, `worker_model`, `worker_effort`, `limit`
+(1–8, default 4), `yolo` (boolean, default true), `args`, `worker_args` (CLI
+argument arrays),
 and agent-level `env` defaults. Environment defaults apply only when the
 variable is not already present externally. OpenCode models require
 provider/model identifiers and reasoning effort is provider-specific. Tool names
@@ -201,7 +203,13 @@ There is no automatic budget switching.
 Codex model and effort choices come from the selected CodexRadar recommendation;
 Codex scenes are not locally configured. The selected recommendation supplies
 the lead pair, and `worker_model` / `worker_effort` remain the default pair for
-per-task subagent selection in configured team presets.
+per-task subagent selection in configured team presets. The lead receives the
+launch-time cached scene recommendations that fit its ceiling and available
+model descriptions from the local Codex catalog, and should match them to each
+subtask. When the catalog advertises supported effort levels for a model,
+worker choices omit other levels; a stale catalog is advisory. Unknown and above-ceiling pairs are omitted. These are
+advisory, and native routing remains instruction-driven. Set `codex.team.limit`
+in the override file to change its worker cap.
 To rank a custom model or alias, add its positive integer tier under
 `model_tiers` in `$XDG_CONFIG_HOME/agent-team/model-levels.json`. Add a
 `model_families` suffix when a provider introduces versioned model names that

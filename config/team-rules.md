@@ -9,8 +9,9 @@ Simple tasks stay with the primary agent. Without this opt-in marker, this
 section does not enable delegation.
 
 The primary agent owns decomposition, important decisions, integration, and
-final verification. Use at most two concurrent subagents (or a lower configured
-limit) and keep delegation one level deep: subagents do not spawn further agents.
+final verification. Use at most the injected `limit` concurrent subagents; use
+fewer when the work does not benefit from additional parallelism. Keep delegation
+one level deep: subagents do not spawn further agents.
 The main session selects one execution mode at startup. By default use native
 subagents only, without tmux panes. With explicit `--tmux`, use only interactive
 pane workers through `agent-team`, following the injected pane protocol. Do not

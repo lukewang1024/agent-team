@@ -20,15 +20,15 @@ Lead workflow:
    relevant context, file ownership, prerequisites, acceptance criteria).
 2. Choose a model and effort pair from the injected
    `model_policy.allowed_worker_settings` for this brief. Each entry includes its
-   combined level. Use `default_worker_model` and `default_worker_effort` when no
-   different level is needed. Run
+   combined level. Match the brief to available task recommendations where
+   applicable; otherwise choose an allowed pair suited to the work. Run
    `agent-team spawn <name> --file <brief-path> --model <model> --effort <effort>`
    to start an interactive worker. The receipt and worker brief contain an
    assignment ID and attempt ID; keep both with the task. The controller rejects a combined level above
    the lead's. Defaults use the latest model generation configured for that CLI
    and tier; Codex uses newer generations from its active CodexRadar cache.
    Names must match `[a-z][a-z0-9_-]{0,39}` and cannot be `lead`; use
-   `worker_a` and `worker_b`, not A/B. At most two worker panes may coexist.
+   `worker_a` and `worker_b`, not A/B. At most the injected `limit` worker panes may coexist.
 3. Continue independent work. Use `agent-team receive` at coordination points,
    or `agent-team wait --timeout 30` when waiting for results. Both return
    unacknowledged messages without consuming them. After handling each message,

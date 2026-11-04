@@ -813,6 +813,16 @@ def latest_worker_config(cfg, tool):
     return result
 
 
+def cached_codex_model_catalog():
+    path = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "models_cache.json"
+    try:
+        models = read(path).get("models", [])
+        return {model_key(model["slug"]): model for model in models
+                if isinstance(model, dict) and isinstance(model.get("slug"), str)}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+
+
 def model_policy(cfg, tool, mode):
     main_model = cfg.get("model")
     cfg = latest_worker_config(cfg, tool)
@@ -829,6 +839,8 @@ def model_policy(cfg, tool, mode):
         candidates = [latest[tier] for tier in sorted(latest)]
     else:
         candidates = list(dict.fromkeys(model for model in (default_model, main_model) if model))
+    catalog = cached_codex_model_catalog() if tool == "codex" else {}
+    model_descriptions = {}
     allowed_settings = []
     allowed_models = []
     for candidate in candidates:
@@ -842,6 +854,14 @@ def model_policy(cfg, tool, mode):
         else:
             effort_ranks = [(name, rank) for name, rank in policy["thinking_levels"].items()
                             if tier * 10 + rank <= lead_level]
+        metadata = catalog.get(model_key(candidate), {})
+        supported = {entry.get("effort") for entry in metadata.get("supported_reasoning_levels", [])
+                     if isinstance(entry, dict)}
+        if supported:
+            effort_ranks = [(name, rank) for name, rank in effort_ranks if name in supported]
+        description = metadata.get("description")
+        if isinstance(description, str) and description.strip():
+            model_descriptions[candidate] = description.strip()
         if not any(model_key(candidate) == model_key(model) for model in allowed_models):
             allowed_models.append(candidate)
         for effort, rank in sorted(effort_ranks, key=lambda item: item[1]):
@@ -856,7 +876,17 @@ def model_policy(cfg, tool, mode):
     else:
         default_level = None
     dynamic = mode == "tmux" or (mode == "native" and tool == "codex")
+    # Recommendations are advisory, and only exact pairs within the same
+    # allowed set may be offered. Unknown or over-ceiling entries are omitted.
+    allowed_pairs = {(model_key(item["model"]), item["effort"]) for item in allowed_settings}
+    recommendations = [
+        {"scene": item.get("label", item["id"]), "model": item["model"], "effort": item["effort"]}
+        for item in cfg.get("worker_recommendations", [])
+        if (model_key(item["model"]), item["effort"]) in allowed_pairs
+    ] if tool == "codex" else []
     return {
+        "task_recommendations": recommendations,
+        "model_descriptions": model_descriptions,
         "lead_model": main_model,
         "lead_effort": lead_effort,
         "lead_level": display_level(lead_level) if lead_level is not None else None,
@@ -939,7 +969,18 @@ def codex_settings(recommendation_id=None, team=False, cache=None):
             recommendation_timestamp(cache), team_roles=team,
         )
     value.update(recommendation_id=recommendation_id if recommendation else None)
-    value.setdefault("limit", 2)
+    if team:
+        # Keep the exact launch-time cache snapshot so task routing is coherent
+        # with the recommendation chosen for the lead.
+        value["worker_recommendations"] = codex_radar_items(cache)
+        override = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-team/config.json"
+        if override.exists():
+            personal = read(override).get("codex", {}).get("team", {})
+            if "limit" in personal:
+                value["limit"] = personal["limit"]
+    value.setdefault("limit", 4)
+    if type(value["limit"]) is not int or not 1 <= value["limit"] <= 8:
+        fail("Team limit must be an integer from 1 to 8")
     value.setdefault("yolo", team)
     return value
 
@@ -983,12 +1024,12 @@ def scene_settings(scene=None, team=False, adjustment=None, tool="codex"):
             fail("Unknown " + tool + " adjustment: " + adjustment)
         value.update(adjustment_value)
     value.update(scene=scene, adjustment=adjustment)
-    value.setdefault("limit", 2)
+    value.setdefault("limit", 4)
     value.setdefault("yolo", team)
     if not isinstance(value["yolo"], bool):
         fail("Scene yolo must be a boolean")
-    if type(value["limit"]) is not int or not 1 <= value["limit"] <= 2:
-        fail("Team limit must be 1 or 2")
+    if type(value["limit"]) is not int or not 1 <= value["limit"] <= 8:
+        fail("Team limit must be an integer from 1 to 8")
     return value
 
 
@@ -1150,9 +1191,9 @@ def settings(tool, budget, expert=False):
     value.setdefault("yolo", True)
     if not isinstance(value["yolo"], bool):
         fail("yolo must be a boolean")
-    value.setdefault("limit", 2)
-    if not isinstance(value["limit"], int) or not 1 <= value["limit"] <= 2:
-        fail("Team limit must be 1 or 2")
+    value.setdefault("limit", 4)
+    if type(value["limit"]) is not int or not 1 <= value["limit"] <= 8:
+        fail("Team limit must be an integer from 1 to 8")
     for key in ("model", "effort", "worker_model", "worker_effort"):
         if value.get(key) is not None and not isinstance(value[key], str):
             fail(f"{key} must be a string or null")
@@ -1239,7 +1280,7 @@ def instructions(mode, worker=False, cfg=None, budget=False, expert=False, tool=
               "scene:" + scene + ":team" if scene else
               "team-expert" if expert else "team-budget" if budget else "team")
     selected = {"recommendation_id": recommendation_id, "scene": scene,
-                "fast": cfg.get("fast"), "preset": preset, "mode": mode,
+                "fast": cfg.get("fast"), "preset": preset, "mode": mode, "limit": cfg.get("limit", 4),
                 **{key: cfg.get(key) for key in ("model", "effort", "worker_model", "worker_effort")}}
     policy = model_policy(cfg, tool, mode)
     if worker:
@@ -1250,7 +1291,12 @@ def instructions(mode, worker=False, cfg=None, budget=False, expert=False, tool=
             "Choose each worker model and reasoning effort together from "
             "model_policy.allowed_worker_settings. The default worker combination is a fallback, "
             "not a fixed assignment. Set both model and reasoning_effort on each spawn "
-            "when the runtime accepts them. Never choose a combined level above lead_level; "
+            "when the runtime accepts them. Match the subtask to the scene labels in "
+            "model_policy.task_recommendations and model_policy.model_descriptions and prefer a matching pair; distinguish simple "
+            "bounded/background work from difficult reasoning and interactive work. If no scene "
+            "matches, choose an allowed pair for the task rather than blindly inheriting the lead. "
+            "Recommendations are hints, not guarantees of model availability or quality. "
+            "Never choose a combined level above lead_level; "
             "the lead's own model and effort remain unchanged.\n"
         )
     else:
@@ -1259,7 +1305,7 @@ def instructions(mode, worker=False, cfg=None, budget=False, expert=False, tool=
             "substitute another model or switch presets.\n"
         )
     common = ("Resolved configuration for THIS invocation (authoritative; do not infer it "
-              "from other profiles or repository examples):\n" + json.dumps(selected) + "\n"
+              "from other profiles or repository examples):\n" + json.dumps(selected, ensure_ascii=False) + "\n"
               + model_instruction
               + "Do not switch the lead's preset. For native Codex spawns, use fresh context "
               "(fork_turns=none). Leave an omitted reasoning setting inherited only when the "

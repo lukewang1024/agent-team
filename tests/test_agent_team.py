@@ -90,6 +90,55 @@ class AdapterTests(unittest.TestCase):
                 self.assertFalse(any('model_reasoning_effort=' in arg for arg in plan['argv']))
                 self.assertFalse(any('service_tier=' in arg for arg in plan['argv']))
 
+    def test_recommendations_route_only_allowed_scenes_and_keep_lead(self):
+        cache = {'source_url': TEAM.codex_radar_options()['url'], 'recommendations': {'items': [
+            {'id': 'daily', 'source_key': 'daily', 'label': '日常开发', 'model': 'gpt-6.1-terra', 'effort': 'max'},
+            {'id': 'batch', 'source_key': 'batch', 'label': '后台自动化', 'model': 'gpt-6-luna', 'effort': 'max'},
+            {'id': 'hard', 'source_key': 'hard', 'label': '难题攻坚', 'model': 'gpt-6-astra', 'effort': 'xhigh'},
+            {'id': 'unknown', 'source_key': 'unknown', 'label': '未知', 'model': 'other-model', 'effort': 'max'},
+        ]}}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'XDG_CONFIG_HOME': directory}):
+            cfg = TEAM.codex_settings('daily', team=True, cache=cache)
+            with patch.object(TEAM, 'latest_models_by_tier', return_value={1: 'gpt-6-luna', 2: 'gpt-6.1-terra', 4: 'gpt-6-astra'}):
+                policy = TEAM.model_policy(cfg, 'codex', 'native')
+                prompt = TEAM.instructions('native', cfg=cfg, tool='codex')
+        self.assertEqual(cfg['model'], 'gpt-6.1-terra')
+        self.assertEqual(cfg['limit'], 4)
+        self.assertEqual([r['scene'] for r in policy['task_recommendations']], ['日常开发', '后台自动化'])
+        self.assertEqual(policy['task_recommendations'][1]['model'], 'gpt-6-luna')
+        self.assertIn('Match the subtask to the scene labels', prompt)
+        self.assertIn('后台自动化', prompt)
+        self.assertNotIn('难题攻坚', prompt)
+        args, _ = TEAM.command('codex', cfg, 'native')
+        self.assertIn('agents.max_concurrent_threads_per_session=4', args)
+
+    def test_catalog_descriptions_and_efforts_guide_worker_selection(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'CODEX_HOME': directory}):
+            (Path(directory) / 'models_cache.json').write_text(json.dumps({'models': [
+                {'slug': 'gpt-6-luna', 'description': 'Fast for easy tasks',
+                 'supported_reasoning_levels': [{'effort': 'high'}, {'effort': 'max'}]}
+            ]}))
+            with patch.object(TEAM, 'latest_models_by_tier', return_value={1: 'gpt-6-luna', 2: 'gpt-6.1-terra'}):
+                policy = TEAM.model_policy({'model': 'gpt-6.1-terra', 'effort': 'max'}, 'codex', 'native')
+        self.assertEqual(policy['model_descriptions']['gpt-6-luna'], 'Fast for easy tasks')
+        luna_efforts = [item['effort'] for item in policy['allowed_worker_settings'] if item['model'] == 'gpt-6-luna']
+        self.assertEqual(luna_efforts, ['high', 'max'])
+
+    def test_team_limit_default_and_override(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'XDG_CONFIG_HOME': directory}):
+            folder = Path(directory) / 'agent-team'
+            folder.mkdir()
+            self.assertEqual(TEAM.codex_settings(team=True, cache={})['limit'], 4)
+            self.assertEqual(TEAM.settings('claude', False)['limit'], 4)
+            self.assertEqual(TEAM.scene_settings('daily', team=True, tool='traex')['limit'], 4)
+            for limit in (1, 6, 8):
+                (folder / 'config.json').write_text(json.dumps({'codex': {'team': {'limit': limit}}}))
+                self.assertEqual(TEAM.codex_settings(team=True, cache={})['limit'], limit)
+            for limit in (0, 9, True):
+                (folder / 'config.json').write_text(json.dumps({'codex': {'team': {'limit': limit}}}))
+                with self.assertRaisesRegex(RuntimeError, 'Team limit'):
+                    TEAM.codex_settings(team=True, cache={})
+
     def test_fast_service_tier_is_only_sent_when_explicit(self):
         for flags, expected in [([], None), (['--fast'], 'fast'), (['--no-fast'], 'default')]:
             with self.subTest(flags=flags), contextlib.redirect_stdout(io.StringIO()) as output, \
@@ -768,8 +817,10 @@ class PaneTests(unittest.TestCase):
         self.assertLess(positions[lead][0], positions[one][0])
         self.assertEqual(positions[one][0], positions[two][0])
         self.assertNotEqual(positions[one][1], positions[two][1])
+        self.spawn('three')
+        self.spawn('four')
         with self.assertRaisesRegex(RuntimeError, 'limit'):
-            self.spawn('three')
+            self.spawn('five')
         with self.assertRaisesRegex(RuntimeError, 'Only the lead'):
             self.control('spawn', 'recursive', '--file', self.file('x', 'x'), role='one')
         self.report('one')
@@ -782,7 +833,7 @@ class PaneTests(unittest.TestCase):
         self.control('send', 'one', '--file', self.file('followup', hostile), '--wake')
         self.wait_for(lambda: 'team message is waiting' in self.capture('one'))
         self.assertEqual(json.loads(self.control('receive', role='one'))[0]['text'], hostile)
-        self.assertEqual(len(self.state()['members']), 3)
+        self.assertEqual(len(self.state()['members']), 5)
         self.control('stop', 'two')
         self.assertEqual(self.state()['members']['two']['status'], 'stopped')
 
