@@ -132,10 +132,14 @@ Pane headers keep a fixed `lead |` or `worker |` prefix before the live terminal
 title, so application title updates cannot erase the role.
 Switch panes to inspect progress or interact. Existing windows and panes are
 left unchanged. Native and pane members never mix in the same team. Team management uses
-spawn, send, receive, report, wait, status and stop commands; see
+spawn, assign, send, receive, ack, report, wait, status and stop commands; see
 [the pane protocol](config/team-pane.md). Messages persist in a local mailbox. They are
 read at checkpoints or through a bounded wait, not pushed through a tool-native
-notification API. `send --wake` submits a notice to an idle worker's input;
+notification API. Messages remain available until explicitly acknowledged, and
+`receive --all` inspects mailbox history. Teams already running when the CLI is
+updated retain their original mailbox and reporting protocol. Assignment and attempt IDs fence late
+reports; `assign` creates a follow-up or a retry on a settled worker. Optional
+request IDs make repeated send/assign requests idempotent. `send --wake` submits a notice to an idle worker's input;
 avoid doing that while a person is typing. Lead exit normally closes worker panes.
 Forced terminal/server termination may need manual cleanup of the team window.
 

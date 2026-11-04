@@ -1288,6 +1288,11 @@ def command(tool, cfg, mode, worker=False, extra=(), brief=None, budget=False, e
         prefix = shlex.join(["env", "AGENT_TEAM_DIR=" + os.environ["AGENT_TEAM_DIR"],
                              "AGENT_TEAM_ROLE=" + os.environ.get("AGENT_TEAM_ROLE", "lead"), "agent-team"])
         prompt += "\nYour team command prefix (also works if the tool strips inherited environment): " + prefix
+        state_path = Path(os.environ["AGENT_TEAM_DIR"]) / "state.json"
+        if state_path.exists() and read(state_path).get("protocol_version", 1) < 2:
+            prompt += ("\nThis existing team uses the legacy pane protocol. Override the new pane "
+                       "instructions: receive/wait consume messages immediately; do not use ack or "
+                       "assign. Report without assignment or attempt flags, and use send for follow-up work.\n")
     model = cfg.get("worker_model", cfg.get("model")) if worker else cfg.get("model")
     effort = cfg.get("worker_effort", cfg.get("effort")) if worker else cfg.get("effort")
     disabled = mode == "tmux" or worker
@@ -1631,7 +1636,7 @@ def launch(tool, argv, resolved=None):
     base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "agent-team"
     directory = base / ident
     directory.mkdir(parents=True, mode=0o700)
-    state = {"id": ident, "tool": tool, "config": cfg, "budget": budget, "expert": expert,
+    state = {"id": ident, "protocol_version": 2, "tool": tool, "config": cfg, "budget": budget, "expert": expert,
              "cwd": cwd, "extra": forwarded, "members": {}, "messages": [], "next_message": 1}
     write(directory / "state.json", state)
     shell_command = runner(directory, "lead")
@@ -1761,6 +1766,11 @@ def run_pane(directory, name):
     worker = name != "lead"
     member = state["members"][name]
     brief = member.get("brief") if worker else None
+    if worker and member.get("assignment"):
+        assignment = member["assignment"]
+        brief += ("\n\nAssignment ID: " + assignment["assignment_id"]
+                  + "\nAttempt ID: " + assignment["attempt_id"]
+                  + "\nUse these exact IDs when reporting this assignment.")
     cfg = state["config"]
     if worker:
         cfg = dict(cfg)
@@ -1800,6 +1810,32 @@ def wake(state, target):
         tmux("delete-buffer", "-b", buffer, check=False)
 
 
+def new_assignment(retry_of=None):
+    return {"assignment_id": uuid.uuid4().hex, "attempt_id": uuid.uuid4().hex,
+            "retry_of": retry_of, "status": "running", "reports": {}}
+
+
+def pending_messages(state, role):
+    cursor = state["members"][role].get("cursor", 0)  # legacy sessions
+    return [m for m in state["messages"] if m["to"] == role and m["id"] > cursor
+            and not m.get("acknowledged", False)]
+
+
+def pane_presence(state, pane):
+    """Distinguish a missing pane from an unavailable control channel."""
+    result = subprocess.run(tmux_argv("list-panes", "-t", state["window"], "-F", "#{pane_id}"),
+                            text=True, capture_output=True)
+    if result.returncode:
+        return "unknown"
+    if pane not in result.stdout.splitlines():
+        return "absent"
+    result = subprocess.run(tmux_argv("show-options", "-p", "-v", "-t", pane, "@agent_team"),
+                            text=True, capture_output=True)
+    if result.returncode:
+        return "unknown"
+    return "owned" if result.stdout.strip() == state["id"] else "unowned"
+
+
 def control(argv):
     parser = argparse.ArgumentParser(description="Interactive pane team control; requires AGENT_TEAM_DIR")
     subs = parser.add_subparsers(dest="action", required=True)
@@ -1808,14 +1844,26 @@ def control(argv):
     spawn.add_argument("--file", required=True, help="UTF-8 task brief")
     spawn.add_argument("--model", help="Per-worker model; combined level must not exceed the lead")
     spawn.add_argument("--effort", help="Per-worker reasoning effort")
+    assign = subs.add_parser("assign", help="Assign follow-up work to a settled worker")
+    assign.add_argument("name")
+    assign.add_argument("--file", required=True)
+    assign.add_argument("--retry-of", help="Attempt ID being retried")
+    assign.add_argument("--wake", action="store_true")
+    assign.add_argument("--request-id", help="Stable key for retrying the same assignment request")
     send = subs.add_parser("send")
     send.add_argument("name")
     send.add_argument("--file", required=True)
     send.add_argument("--wake", action="store_true", help="Submit a notice to an idle pane; do not use while someone is typing")
+    send.add_argument("--request-id", help="Stable key for retrying the same send")
     report = subs.add_parser("report")
     report.add_argument("--file", required=True)
     report.add_argument("--status", choices=["ready", "blocked"], default="ready")
-    subs.add_parser("receive")
+    report.add_argument("--assignment", help="Assignment ID from the task brief")
+    report.add_argument("--attempt", help="Attempt ID from the task brief")
+    receive = subs.add_parser("receive")
+    receive.add_argument("--all", action="store_true", help="Inspect mailbox history, including acknowledged messages")
+    ack = subs.add_parser("ack", help="Acknowledge one received message")
+    ack.add_argument("--id", required=True, type=int)
     wait = subs.add_parser("wait")
     wait.add_argument("--timeout", type=int, default=30)
     subs.add_parser("status")
@@ -1828,21 +1876,21 @@ def control(argv):
     if args.action == "doctor":
         print(json.dumps(probe(read(directory / "state.json"), role)))
         return
-    if args.action in ("spawn", "stop") or (args.action == "send" and args.wake):
+    if args.action in ("spawn", "stop", "assign") or (args.action == "send" and args.wake):
         probe(read(directory / "state.json"), role)
     if args.action == "wait":
         deadline = time.monotonic() + min(max(args.timeout, 0), 60)
         while True:
             state = read(directory / "state.json")
-            cursor = state["members"][role].get("cursor", 0)
-            if any(m["to"] == role and m["id"] > cursor for m in state["messages"]) or time.monotonic() >= deadline or state.get("closed"):
+            if pending_messages(state, role) or time.monotonic() >= deadline or state.get("closed"):
                 args.action = "receive"
+                args.all = False
                 break
             time.sleep(0.2)
     with locked(directory) as state:
         if role not in state["members"]:
             fail("Unknown team member")
-        if state.get("closed") and args.action not in ("status", "receive"):
+        if state.get("closed") and args.action not in ("status", "receive", "ack"):
             fail("Team is closed")
         if args.action == "spawn":
             if role != "lead":
@@ -1866,51 +1914,170 @@ def control(argv):
                 tmux("set-option", "-p", "-t", pane, "@agent_team", state["id"])
                 tmux("set-option", "-p", "-t", pane, "@agent_team_role", "worker")
                 tmux("select-pane", "-t", pane, "-T", args.name)
+                assignment = new_assignment() if state.get("protocol_version", 1) >= 2 else None
                 state["members"][args.name] = {"pane": pane, "status": "running", "cursor": 0,
-                                               "brief": brief, "model": model, "effort": effort}
+                                               "brief": brief, "model": model, "effort": effort,
+                                               "assignment": assignment, "assignment_history": []}
                 layout(state)
             except BaseException:
                 tmux("kill-pane", "-t", pane, check=False)
                 state["members"].pop(args.name, None)
                 raise
-            print(json.dumps({"name": args.name, "pane": pane, "model": model, "effort": effort}))
+            result = {"name": args.name, "pane": pane, "model": model, "effort": effort}
+            if assignment:
+                result.update(assignment_id=assignment["assignment_id"], attempt_id=assignment["attempt_id"])
+        elif args.action == "assign":
+            if role != "lead":
+                fail("Only the lead may assign follow-up work")
+            if state.get("protocol_version", 1) < 2:
+                fail("This team uses the legacy protocol; use send for follow-up work")
+            item = state["members"].get(args.name)
+            if not item or args.name == "lead":
+                fail("Unknown worker")
+            body = Path(args.file).read_text()
+            if args.request_id:
+                prior = next((m for m in state["messages"] if m.get("request_id") == args.request_id
+                              and m["from"] == role), None)
+                if prior:
+                    if (prior["type"] != "assignment" or prior["to"] != args.name
+                            or prior["text"] != body or prior.get("retry_of") != args.retry_of):
+                        fail("Request ID already used for a different message")
+                    print(json.dumps({"queued": prior["id"], "to": args.name, "duplicate": True,
+                                      "assignment_id": prior["assignment_id"], "attempt_id": prior["attempt_id"],
+                                      "wake": "not_repeated", "next_action": "inspect recipient status"}))
+                    return
+            if not owned(state, item["pane"]):
+                fail("Worker pane is unavailable; inspect status before assigning")
+            previous = item.get("assignment")
+            if item["status"] not in ("ready", "blocked"):
+                fail("Worker has not reported ready or blocked")
+            if args.retry_of and (not previous or args.retry_of != previous["attempt_id"]):
+                fail("Retry must name the worker's current attempt")
+            assignment = new_assignment(args.retry_of)
+            if args.retry_of:
+                assignment["assignment_id"] = previous["assignment_id"]
+            if previous:
+                item.setdefault("assignment_history", []).append(previous)
+            item["assignment"] = assignment
+            item["status"] = "assigned"
+            message = {"id": state["next_message"], "from": role, "to": args.name,
+                       "text": body, "type": "assignment", "timestamp": time.time(),
+                       "assignment_id": assignment["assignment_id"], "attempt_id": assignment["attempt_id"],
+                       "retry_of": args.retry_of}
+            if args.request_id:
+                message["request_id"] = args.request_id
+            state["next_message"] += 1
+            state["messages"].append(message)
+            write(directory / "state.json", state)
+            wake_status = "not_requested"
+            if args.wake:
+                try:
+                    wake(state, args.name)
+                    wake_status = "submitted"
+                    item["status"] = "running"
+                except (RuntimeError, OSError) as exc:
+                    wake_status = "failed: " + str(exc)
+            result = {"queued": message["id"], "to": args.name, "wake": wake_status,
+                      "assignment_id": assignment["assignment_id"], "attempt_id": assignment["attempt_id"],
+                      "next_action": "worker must receive and acknowledge the assignment"}
         elif args.action in ("send", "report"):
             target = args.name if args.action == "send" else "lead"
             if target not in state["members"]:
                 fail("Unknown recipient")
-            message = {"id": state["next_message"], "from": role, "to": target, "text": Path(args.file).read_text(), "type": args.action, "timestamp": time.time()}
+            body = Path(args.file).read_text()
+            assignment = state["members"][role].get("assignment") if args.action == "report" else None
+            if assignment:
+                if (args.assignment, args.attempt) != (assignment["assignment_id"], assignment["attempt_id"]):
+                    fail("Report must name the current assignment and attempt")
+                previous_report = assignment["reports"].get(args.status)
+                if previous_report:
+                    if previous_report["text"] != body:
+                        fail("Conflicting report for this attempt and status")
+                    if assignment["status"] == args.status:
+                        state["members"][role]["status"] = args.status
+                    result = {"queued": previous_report["message_id"], "to": target, "duplicate": True}
+                    print(json.dumps(result))
+                    return
+                if assignment["status"] == "ready":
+                    fail("Attempt is already complete")
+            elif args.action == "report" and (args.assignment or args.attempt):
+                fail("No current assignment for this worker")
+            if args.action == "send" and args.request_id:
+                prior = next((m for m in state["messages"] if m.get("request_id") == args.request_id
+                              and m["from"] == role), None)
+                if prior:
+                    if prior["to"] != target or prior["text"] != body or prior["type"] != "send":
+                        fail("Request ID already used for a different message")
+                    print(json.dumps({"queued": prior["id"], "to": target, "duplicate": True,
+                                      "wake": "not_repeated", "next_action": "inspect recipient status"}))
+                    return
+            message = {"id": state["next_message"], "from": role, "to": target, "text": body, "type": args.action, "timestamp": time.time()}
+            if args.action == "send" and args.request_id:
+                message["request_id"] = args.request_id
+            if assignment:
+                message.update(assignment_id=assignment["assignment_id"], attempt_id=assignment["attempt_id"], status=args.status)
             state["next_message"] += 1
             state["messages"].append(message)
             if args.action == "report":
                 state["members"][role]["status"] = args.status
+                if assignment:
+                    assignment["status"] = args.status
+                    assignment["reports"][args.status] = {"text": body, "message_id": message["id"]}
             write(directory / "state.json", state)
+            wake_status = "not_requested"
             if args.action == "send" and args.wake:
-                if state["members"][target]["status"] not in ("ready", "blocked"):
-                    fail("Message queued, but target is not idle; receive it during current work")
-                wake(state, target)
-                state["members"][target]["status"] = "running"
-            print(json.dumps({"queued": message["id"], "to": target}))
+                if state["members"][target]["status"] not in ("ready", "blocked", "assigned"):
+                    wake_status = "not_idle"
+                else:
+                    try:
+                        wake(state, target)
+                        wake_status = "submitted"
+                        state["members"][target]["status"] = "running"
+                    except (RuntimeError, OSError) as exc:
+                        wake_status = "failed: " + str(exc)
+            result = {"queued": message["id"], "to": target, "wake": wake_status,
+                      "next_action": "recipient must receive and acknowledge the message"}
         elif args.action == "receive":
-            cursor = state["members"][role].get("cursor", 0)
-            messages = [m for m in state["messages"] if m["to"] == role and m["id"] > cursor]
-            if messages:
-                state["members"][role]["cursor"] = messages[-1]["id"]
-            print(json.dumps(messages, ensure_ascii=False))
+            result = ([m for m in state["messages"] if m["to"] == role] if args.all
+                      else pending_messages(state, role))
+            if not args.all and state.get("protocol_version", 1) < 2 and result:
+                state["members"][role]["cursor"] = result[-1]["id"]
+        elif args.action == "ack":
+            message = next((m for m in state["messages"] if m["id"] == args.id and m["to"] == role), None)
+            if not message:
+                fail("Message not found in this recipient's mailbox")
+            message["acknowledged"] = True
+            result = {"acknowledged": args.id}
         elif args.action == "status":
-            print(json.dumps({n: {"pane": m["pane"], "status": m["status"], "alive": owned(state, m["pane"]),
+            result = {n: {"pane": m["pane"], "status": m["status"], "alive": owned(state, m["pane"]),
+                                "assignment": m.get("assignment"),
                                 "model": m.get("model", state["config"].get("model") if n == "lead" else state["config"].get("worker_model")),
                                 "effort": m.get("effort", state["config"].get("effort") if n == "lead" else state["config"].get("worker_effort"))}
-                              for n, m in state["members"].items()}, indent=2))
+                              for n, m in state["members"].items()}
         elif args.action == "stop":
             if role != "lead" or args.name == "lead":
                 fail("Only the lead may stop workers")
             item = state["members"].get(args.name)
             if not item:
                 fail("Unknown member")
-            if owned(state, item["pane"]):
-                tmux("kill-pane", "-t", item["pane"])
-            item["status"] = "stopped"
-            layout(state)
+            presence = pane_presence(state, item["pane"])
+            if presence == "owned":
+                try:
+                    tmux("kill-pane", "-t", item["pane"])
+                except RuntimeError:
+                    pass
+                presence = pane_presence(state, item["pane"])
+            if presence == "absent":
+                item["status"] = "stopped"
+                layout(state)
+                result = {"name": args.name, "status": "stopped", "pane": "absent",
+                          "next_action": "review any outstanding result"}
+            else:
+                result = {"name": args.name, "status": "stop_unknown", "pane": presence,
+                          "next_action": "inspect the pane and team status before retrying"}
+    print(json.dumps(result, ensure_ascii=False))
+    if args.action == "stop" and result["status"] == "stop_unknown":
+        fail("Stop outcome unknown; inspect the receipt before retrying")
 
 
 def main():
@@ -1995,7 +2162,7 @@ def main():
 
               "       agent-team solo traex budget [TraeX args]\n"
               "       agent-team run <traex|opencode|claude> [--budget] [--no-yolo] [CLI args]\n"
-              "       agent-team <spawn|send|report|receive|wait|status|stop|doctor> --help\n"
+              "       agent-team <spawn|assign|send|report|receive|ack|wait|status|stop|doctor> --help\n"
               "Team default: YOLO and native subagents. --no-yolo inherits CLI permissions. --tmux: interactive pane workers only.\n"
               "--team-dry-run and --solo-dry-run print launch plans without starting an agent.\n"
               "Configure combinations in $XDG_CONFIG_HOME/agent-team/config.json.")

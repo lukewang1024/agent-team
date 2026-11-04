@@ -719,6 +719,12 @@ class PaneTests(unittest.TestCase):
         self.wait_for(lambda: 'interactive-ready' in self.capture(name))
         return json.loads(result)
 
+    def report(self, name, text='evidence', status='ready'):
+        assignment = self.state()['members'][name]['assignment']
+        return json.loads(self.control('report', '--file', self.file(name + '-result', text),
+                                       '--status', status, '--assignment', assignment['assignment_id'],
+                                       '--attempt', assignment['attempt_id'], role=name))
+
     def test_codex_team_worker_uses_native_defaults_when_recommendations_are_missing(self):
         codex_home = self.root / 'codex-home'; codex_home.mkdir()
         (codex_home / 'models_cache.json').write_text(json.dumps({'models':[
@@ -737,7 +743,7 @@ class PaneTests(unittest.TestCase):
         self.directory = next(path for path in (self.root / 'state/agent-team').iterdir() if path not in previous)
         self.env['AGENT_TEAM_DIR'] = str(self.directory)
         self.wait_for(lambda: 'interactive-ready' in self.capture('lead'))
-        self.spawn('worker_a')
+        worker = self.spawn('worker_a')
         for role in ('lead', 'worker_a'):
             args = json.loads((self.directory / (role+'-argv.json')).read_text())
             self.assertNotIn('-m', args)
@@ -746,6 +752,9 @@ class PaneTests(unittest.TestCase):
                 'model_reasoning_effort=' + json.dumps(TEAM.model_policy_config()['default_thinking_level'])]
             self.assertEqual(efforts, expected)
             self.assertFalse(any('service_tier=' in arg for arg in args))
+            if role == 'worker_a':
+                self.assertIn(worker['assignment_id'], args[-1])
+                self.assertIn(worker['attempt_id'], args[-1])
         self.assertIsNone(self.state()['config']['recommendation_id'])
     def test_interactive_layout_cap_mailbox_reuse_and_stop(self):
         self.spawn('one')
@@ -763,9 +772,11 @@ class PaneTests(unittest.TestCase):
             self.spawn('three')
         with self.assertRaisesRegex(RuntimeError, 'Only the lead'):
             self.control('spawn', 'recursive', '--file', self.file('x', 'x'), role='one')
-        self.control('report', '--file', self.file('result', 'evidence'), role='one')
+        self.report('one')
         messages = json.loads(self.control('receive'))
         self.assertEqual(messages[0]['text'], 'evidence')
+        self.assertEqual(json.loads(self.control('receive')), messages)
+        self.control('ack', '--id', str(messages[0]['id']))
         self.assertEqual(json.loads(self.control('receive')), [])
         hostile = "literal `touch NO` $(touch NO)\nnew line"
         self.control('send', 'one', '--file', self.file('followup', hostile), '--wake')
@@ -861,6 +872,88 @@ class PaneTests(unittest.TestCase):
 
     def test_queued_message_does_not_claim_delivery(self):
         self.spawn('one')
-        with self.assertRaisesRegex(RuntimeError, 'queued'):
-            self.control('send', 'one', '--file', self.file('queued', 'later'), '--wake')
+        receipt = json.loads(self.control('send', 'one', '--file', self.file('queued', 'later'), '--wake'))
+        self.assertEqual(receipt['wake'], 'not_idle')
         self.assertEqual(json.loads(self.control('receive', role='one'))[0]['text'], 'later')
+
+    def test_assign_retry_fences_stale_report_and_duplicate_report(self):
+        first = self.spawn('one')
+        first_result = self.report('one', 'blocked evidence', 'blocked')
+        self.assertTrue(self.report('one', 'blocked evidence', 'blocked')['duplicate'])
+        brief = self.file('retry', 'Try another approach')
+        second = json.loads(self.control('assign', 'one', '--file', brief, '--retry-of', first['attempt_id'],
+                                         '--request-id', 'retry-1'))
+        self.assertEqual(second['assignment_id'], first['assignment_id'])
+        self.assertNotEqual(second['attempt_id'], first['attempt_id'])
+        again = json.loads(self.control('assign', 'one', '--file', brief, '--retry-of', first['attempt_id'],
+                                        '--request-id', 'retry-1'))
+        self.assertEqual(again['queued'], second['queued'])
+        self.assertTrue(again['duplicate'])
+        with self.assertRaisesRegex(RuntimeError, 'current assignment and attempt'):
+            self.control('report', '--file', self.file('old-report', 'late'), '--assignment', first['assignment_id'],
+                         '--attempt', first['attempt_id'], role='one')
+        self.report('one', 'new result')
+        self.assertEqual(self.state()['members']['one']['assignment']['status'], 'ready')
+        self.assertEqual(first_result['queued'], 1)
+
+    def test_mail_replay_ack_and_request_id(self):
+        self.spawn('one')
+        message_file = self.file('send', 'message')
+        first = json.loads(self.control('send', 'one', '--file', message_file, '--request-id', 'send-1'))
+        repeated = json.loads(self.control('send', 'one', '--file', message_file, '--request-id', 'send-1'))
+        self.assertEqual(first['queued'], repeated['queued'])
+        self.assertTrue(repeated['duplicate'])
+        with self.assertRaisesRegex(RuntimeError, 'different message'):
+            self.control('send', 'one', '--file', self.file('different', 'different'), '--request-id', 'send-1')
+        for _ in range(2):
+            self.assertEqual(json.loads(self.control('wait', '--timeout', '0', role='one'))[0]['id'], first['queued'])
+        with self.assertRaisesRegex(RuntimeError, 'recipient'):
+            self.control('ack', '--id', str(first['queued']))
+        self.control('ack', '--id', str(first['queued']), role='one')
+        self.control('ack', '--id', str(first['queued']), role='one')
+        self.assertEqual(json.loads(self.control('receive', role='one')), [])
+
+    def test_wake_failure_retains_assignment_and_returns_recovery_receipt(self):
+        self.spawn('one')
+        self.report('one')
+        with patch.object(TEAM, 'wake', side_effect=RuntimeError('socket lost')):
+            result = json.loads(self.control('assign', 'one', '--file', self.file('next', 'follow up'),
+                                             '--request-id', 'next-1', '--wake'))
+        self.assertIn('socket lost', result['wake'])
+        self.assertEqual(self.state()['members']['one']['status'], 'assigned')
+        self.assertEqual(json.loads(self.control('receive', role='one'))[0]['attempt_id'], result['attempt_id'])
+        self.assertTrue(json.loads(self.control('assign', 'one', '--file', str(self.root / 'next'),
+                                                '--request-id', 'next-1'))['duplicate'])
+
+    def test_existing_team_keeps_legacy_receive_and_reporting(self):
+        self.spawn('one')
+        state = self.state()
+        del state['protocol_version']
+        del state['members']['one']['assignment']
+        TEAM.write(self.directory / 'state.json', state)
+        self.control('report', '--file', self.file('old-result', 'legacy'), role='one')
+        self.assertEqual(json.loads(self.control('receive'))[0]['text'], 'legacy')
+        self.assertEqual(json.loads(self.control('receive')), [])
+        with self.assertRaisesRegex(RuntimeError, 'legacy protocol'):
+            self.control('assign', 'one', '--file', self.file('next', 'work'))
+
+    def test_legacy_team_can_spawn_worker_after_upgrade(self):
+        state = self.state()
+        del state['protocol_version']
+        TEAM.write(self.directory / 'state.json', state)
+        receipt = self.spawn('one')
+        self.assertNotIn('assignment_id', receipt)
+        self.assertIsNone(self.state()['members']['one']['assignment'])
+        with patch.dict(os.environ, dict(self.env, AGENT_TEAM_ROLE='one'), clear=True):
+            args, _ = TEAM.command('claude', self.state()['config'], 'tmux', worker=True, brief='work')
+        self.assertIn('This existing team uses the legacy pane protocol', args[args.index('--append-system-prompt') + 1])
+        self.control('report', '--file', self.file('old-worker-result', 'legacy'), role='one')
+        self.assertEqual(json.loads(self.control('receive'))[0]['text'], 'legacy')
+
+    def test_stop_unknown_does_not_claim_stopped(self):
+        self.spawn('one')
+        with patch.object(TEAM, 'pane_presence', return_value='unknown'):
+            with self.assertRaisesRegex(RuntimeError, 'Stop outcome unknown'):
+                self.control('stop', 'one')
+        self.assertEqual(self.state()['members']['one']['status'], 'running')
+        self.assertTrue(self.capture('one'))
