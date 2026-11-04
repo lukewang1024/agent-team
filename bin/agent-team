@@ -1031,7 +1031,9 @@ def start_codex(argv, tool="codex"):
     parser.add_argument("--fast", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--check", action="store_true", help="Validate scene availability without starting a session")
-    parser.add_argument("--no-yolo", action="store_true")
+    permissions = parser.add_mutually_exclusive_group()
+    permissions.add_argument("--yolo", dest="yolo", action="store_const", const=True, default=None)
+    permissions.add_argument("--no-yolo", dest="yolo", action="store_const", const=False)
     # Unknown CLI arguments retain their order and are forwarded verbatim.
     options, extra = parser.parse_known_args(argv)
     if options.tmux and not options.team:
@@ -1043,8 +1045,8 @@ def start_codex(argv, tool="codex"):
     if options.fast is not None:
         cfg["fast"] = options.fast
         cfg["fast_explicit"] = True
-    if options.no_yolo:
-        cfg["yolo"] = False
+    if options.yolo is not None:
+        cfg["yolo"] = options.yolo
     if tool == "codex" and not has_tier_pair(cfg):
         message = "CodexRadar recommendation unavailable;" if options.recommendation else "No CodexRadar recommendation selected;"
         print("agent-team: " + message + " using Codex defaults", file=sys.stderr)
@@ -2176,7 +2178,7 @@ def main():
         print("Usage: agent-team [--tmux]  # choose a coding agent interactively\n"
               "       agent-team recommendations <status|refresh|prepare>\n"
               "       agent-team <traex|opencode|claude> [--team-budget] [--tmux] [CLI args]\n"
-              "       agent-team start <codex|traex|claude|opencode> [--recommendation ID] [--scene SCENE] [--team] [--tmux] [--fast|--no-fast] [CLI args]\n"
+              "       agent-team start <codex|traex|claude|opencode> [--recommendation ID] [--scene SCENE] [--team] [--tmux] [--fast|--no-fast] [--yolo|--no-yolo] [CLI args]\n"
               "Codex recommendations are loaded from CodexRadar; without a recommendation Codex uses its defaults. Trae scenes: daily|hard|batch.\n"
 
               "       agent-team solo traex budget [TraeX args]\n"

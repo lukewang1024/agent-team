@@ -117,7 +117,8 @@ recommendation picker to refresh immediately, or `f` to toggle Fast off. The
 Workbench Create Agent menu offers the same budget override.
 
 Team defaults to YOLO; `--no-yolo` inherits CLI permissions for the entire team.
-Single inherits CLI permissions unless the caller explicitly opts in. Existing
+For Codex and Trae, `--yolo` explicitly enables YOLO for Single or Team, including
+workers, while `--no-yolo` disables it. Single otherwise inherits CLI permissions. Existing
 sessions keep their current settings. `--dry-run` prints the resolved config
 and argv without starting a model session.
 

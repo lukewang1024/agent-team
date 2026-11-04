@@ -710,6 +710,26 @@ class AdapterTests(unittest.TestCase):
             normalized_prompt,
         )
 
+    def test_explicit_yolo_overrides_apply_to_codex_lead_and_workers(self):
+        for team in (False, True):
+            for enabled in (False, True):
+                flags = ['--yolo' if enabled else '--no-yolo', '--dry-run']
+                if team:
+                    flags += ['--team', '--tmux']
+                with self.subTest(team=team, enabled=enabled), \
+                        patch.object(TEAM, 'CODEX_RADAR_RUNTIME', False), \
+                        contextlib.redirect_stdout(io.StringIO()) as output, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    TEAM.start_codex(flags)
+                plan = json.loads(output.getvalue())
+                self.assertEqual(plan['config']['yolo'], enabled)
+                lead = plan['argv']
+                yolo_flag = '--dangerously-bypass-approvals-and-sandbox' if team else '--yolo'
+                self.assertEqual(yolo_flag in lead, enabled)
+                if team:
+                    worker, _ = TEAM.command('codex', plan['config'], 'tmux', worker=True)
+                    self.assertEqual('--dangerously-bypass-approvals-and-sandbox' in worker, enabled)
+
     def test_yolo_defaults_and_opt_out_cover_every_member(self):
         for tool in TEAM.TOOLS:
             for mode in ('native', 'tmux'):
