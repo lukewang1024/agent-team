@@ -1512,11 +1512,16 @@ def layout(state):
     width, left = map(int, tmux("display-message", "-p", "-t", sidebar,
                                 "#{pane_width} #{pane_left}").split())
     active = tmux("display-message", "-p", "-t", window, "#{pane_id}")
+    # Detaching the selected sidebar would interrupt the user's interaction.
+    # Leave the existing split in place until a later layout operation.
+    if active == sidebar:
+        return
     tmux("break-pane", "-d", "-s", sidebar)
     try:
         tmux("select-layout", "-t", window, "main-vertical")
     finally:
-        args = ["join-pane", "-f", "-h"]
+        # Joining without -d briefly selects the sidebar and steals input.
+        args = ["join-pane", "-d", "-f", "-h"]
         if left == 0:
             args.append("-b")
         try:
@@ -1524,7 +1529,6 @@ def layout(state):
         except RuntimeError:
             # A concurrent resize may make the original width impossible.
             tmux(*args, "-s", sidebar, "-t", window)
-        tmux("select-pane", "-t", active, check=False)
 
 
 def runner(directory, name):

@@ -926,6 +926,59 @@ class PaneTests(unittest.TestCase):
         self.control('stop', 'two')
         self.assertEqual(self.state()['members']['two']['status'], 'stopped')
 
+    def test_spawn_keeps_selected_pane_through_each_layout_step(self):
+        cmd = [self.real_tmux, '-L', self.socket]
+        lead = self.state()['members']['lead']['pane']
+        sidebar = subprocess.check_output(cmd + ['split-window', '-d', '-b', '-h', '-l', '25',
+            '-t', lead, '-P', '-F', '#{pane_id}', 'sleep 300'], text=True).strip()
+        subprocess.run(cmd + ['set-option', '-p', '-t', sidebar, '@pane_role', 'sidebar'], check=True)
+        original_tmux = TEAM.tmux
+        observations = []
+        def observe(*args, **kwargs):
+            result = original_tmux(*args, **kwargs)
+            if args[0] in ('split-window', 'select-pane', 'select-layout', 'break-pane', 'join-pane'):
+                current = subprocess.check_output(cmd + ['display-message', '-p', '-t',
+                    self.state()['window'], '#{pane_id}'], text=True).strip()
+                observations.append((args[0], current))
+            return result
+        with patch.object(TEAM, 'tmux', side_effect=observe):
+            self.spawn('one')
+        self.assertEqual([(op, pane) for op, pane in observations if pane != lead], [], observations)
+
+    def test_spawn_does_not_override_user_focus_change_during_layout(self):
+        cmd = [self.real_tmux, '-L', self.socket]
+        lead = self.state()['members']['lead']['pane']
+        worker = self.spawn('one')['pane']
+        sidebar = subprocess.check_output(cmd + ['split-window', '-d', '-b', '-h', '-l', '25',
+            '-t', lead, '-P', '-F', '#{pane_id}', 'sleep 300'], text=True).strip()
+        subprocess.run(cmd + ['set-option', '-p', '-t', sidebar, '@pane_role', 'sidebar'], check=True)
+        subprocess.run(cmd + ['select-pane', '-t', lead], check=True)
+        original_tmux = TEAM.tmux
+        def change_focus(*args, **kwargs):
+            result = original_tmux(*args, **kwargs)
+            if args[0] == 'break-pane':
+                subprocess.run(cmd + ['select-pane', '-t', worker], check=True)
+            return result
+        with patch.object(TEAM, 'tmux', side_effect=change_focus):
+            self.spawn('two')
+        active = subprocess.check_output(cmd + ['display-message', '-p', '-t',
+            self.state()['window'], '#{pane_id}'], text=True).strip()
+        self.assertEqual(active, worker)
+
+    def test_spawn_leaves_focused_sidebar_in_place(self):
+        cmd = [self.real_tmux, '-L', self.socket]
+        lead = self.state()['members']['lead']['pane']
+        sidebar = subprocess.check_output(cmd + ['split-window', '-d', '-b', '-h', '-l', '25',
+            '-t', lead, '-P', '-F', '#{pane_id}', 'sleep 300'], text=True).strip()
+        subprocess.run(cmd + ['set-option', '-p', '-t', sidebar, '@pane_role', 'sidebar'], check=True)
+        subprocess.run(cmd + ['select-pane', '-t', sidebar], check=True)
+        self.spawn('one')
+        active = subprocess.check_output(cmd + ['display-message', '-p', '-t',
+            self.state()['window'], '#{pane_id}'], text=True).strip()
+        self.assertEqual(active, sidebar)
+        self.assertEqual(subprocess.check_output(cmd + ['display-message', '-p', '-t', sidebar,
+            '#{window_id} #{pane_width}'], text=True).strip(), self.state()['window'] + ' 25')
+
     def test_sidebar_is_preserved_during_spawn_and_stop(self):
         state = self.state()
         cmd = [self.real_tmux, '-L', self.socket]
