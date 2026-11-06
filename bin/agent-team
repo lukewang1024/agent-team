@@ -1498,6 +1498,10 @@ def locked(directory):
 
 
 def owned(state, pane):
+    # tmux treats an empty target as its current pane, which can make every
+    # historical member appear alive (and can target the wrong pane).
+    if not isinstance(pane, str) or not re.fullmatch(r"%[0-9]+", pane):
+        return False
     return tmux("show-options", "-p", "-v", "-t", pane, "@agent_team", check=False) == state["id"]
 
 
@@ -1562,8 +1566,11 @@ def probe(state, role):
     """Read-only socket/ownership check in the calling agent's execution context."""
     if role not in state["members"]:
         fail("Unknown team member")
+    pane = state["members"][role].get("pane")
+    if not isinstance(pane, str) or not re.fullmatch(r"%[0-9]+", pane):
+        fail("Team pane is no longer owned by this session")
     result = subprocess.run(tmux_argv("show-options", "-p", "-v", "-t",
-                             state["members"][role]["pane"], "@agent_team"),
+                             pane, "@agent_team"),
                             text=True, capture_output=True)
     if result.returncode:
         fail("Team control unavailable in this execution context: " + result.stderr.strip()
@@ -1870,6 +1877,8 @@ def pending_messages(state, role):
 
 def pane_presence(state, pane):
     """Distinguish a missing pane from an unavailable control channel."""
+    if not isinstance(pane, str) or not re.fullmatch(r"%[0-9]+", pane):
+        return "absent"
     result = subprocess.run(tmux_argv("list-panes", "-t", state["window"], "-F", "#{pane_id}"),
                             text=True, capture_output=True)
     if result.returncode:
@@ -2099,7 +2108,8 @@ def control(argv):
             result = {n: {"pane": m["pane"], "status": m["status"], "alive": owned(state, m["pane"]),
                                 "assignment": m.get("assignment"),
                                 "model": m.get("model", state["config"].get("model") if n == "lead" else state["config"].get("worker_model")),
-                                "effort": m.get("effort", state["config"].get("effort") if n == "lead" else state["config"].get("worker_effort"))}
+                                "effort": m.get("effort", state["config"].get("effort") if n == "lead" else state["config"].get("worker_effort")),
+                                **({"restore_status": m["restore_status"]} if m.get("restore_status") else {})}
                               for n, m in state["members"].items()}
         elif args.action == "stop":
             if role != "lead" or args.name == "lead":

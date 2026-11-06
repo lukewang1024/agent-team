@@ -920,6 +920,25 @@ class PaneTests(unittest.TestCase):
                                        '--status', status, '--assignment', assignment['assignment_id'],
                                        '--attempt', assignment['attempt_id'], role=name))
 
+    def test_missing_historical_panes_are_not_owned_or_counted(self):
+        state = self.state()
+        state['config']['limit'] = 2
+        for index in range(25):
+            state['members']['historical_' + str(index)] = {'pane': '', 'status': 'stopped', 'cursor': 0}
+        state['members']['historical_0']['restore_status'] = 'unconfirmed'
+        TEAM.write(self.directory / 'state.json', state)
+        status = json.loads(self.control('status'))
+        self.assertTrue(status['lead']['alive'])
+        self.assertTrue(all(not status['historical_' + str(i)]['alive'] for i in range(25)))
+        self.assertEqual(status['historical_0']['restore_status'], 'unconfirmed')
+        with self.assertRaisesRegex(RuntimeError, 'no longer owned'):
+            self.control('doctor', role='historical_0')
+        worker = self.spawn('new_worker')
+        self.assertTrue(worker['pane'].startswith('%'))
+        stopped = json.loads(self.control('stop', 'historical_0'))
+        self.assertEqual(stopped['status'], 'stopped')
+        self.assertTrue(json.loads(self.control('status'))['lead']['alive'])
+
     def test_codex_team_worker_uses_native_defaults_when_recommendations_are_missing(self):
         codex_home = self.root / 'codex-home'; codex_home.mkdir()
         (codex_home / 'models_cache.json').write_text(json.dumps({'models':[

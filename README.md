@@ -262,7 +262,9 @@ Workbench resurrection rebinds the saved team to its new panes, then uses
 member model, and supported launch options. Initial prompts are not replayed.
 Unknown saved options fail explicitly rather than silently changing the team's
 permissions. This requires both the Workbench team sidecar and the original
-team state directory.
+team state directory. Missing pane IDs are never considered live; when a
+member's saved session is ambiguous or missing, `status` reports its
+`restore_status` as `unconfirmed` until the identity is resolved.
 
 Run `agent-team doctor` from the agent's shell execution context before writing
 briefs. It verifies socket access and pane ownership. Spawn, stop and wake also
