@@ -257,6 +257,13 @@ cwd flags are rejected. The tmux socket path is recorded in team state so shell
 tools need not preserve TMUX to find the correct server. Worker names are
 lowercase identifiers such as `worker_a`, never `A` or `B`.
 
+Workbench resurrection rebinds the saved team to its new panes, then uses
+`resume-pane` to restore each session with its original team instructions,
+member model, and supported launch options. Initial prompts are not replayed.
+Unknown saved options fail explicitly rather than silently changing the team's
+permissions. This requires both the Workbench team sidecar and the original
+team state directory.
+
 Run `agent-team doctor` from the agent's shell execution context before writing
 briefs. It verifies socket access and pane ownership. Spawn, stop and wake also
 check the control channel before performing changes. A check in an ordinary

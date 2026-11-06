@@ -21,6 +21,63 @@ LOADER.exec_module(TEAM)
 
 
 class AdapterTests(unittest.TestCase):
+    def test_restored_panes_rebuild_team_policy_without_replaying_prompts(self):
+        self.assertEqual(TEAM.resume_options(['--sandbox', 'read-only', 'old prompt', '--', 'more']),
+                         ['--sandbox', 'read-only'])
+        self.assertEqual(TEAM.resume_options(['--approve-for-me', '--enable', 'feature']),
+                         ['--approve-for-me', '--enable', 'feature'])
+        with self.assertRaisesRegex(RuntimeError, 'unsupported saved option'):
+            TEAM.resume_options(['--unknown-option'])
+        for tool in TEAM.TOOLS:
+            with self.subTest(tool=tool), tempfile.TemporaryDirectory() as root:
+                directory = Path(root)
+                (directory / 'ready').touch()
+                state = {'id': 'test', 'tool': tool, 'cwd': root, 'budget': False,
+                         'config': {'limit': 2, 'yolo': False, 'model': 'lead-model',
+                                    'worker_model': 'worker-model', 'worker_args': []},
+                         'extra': ['old prompt'], 'members': {
+                             'lead': {'pane': '%1', 'status': 'running'},
+                             'worker_a': {'pane': '%2', 'status': 'running', 'brief': 'old assignment'}}}
+                TEAM.write(directory / 'state.json', state)
+                with patch.dict(os.environ, {'TMUX_PANE': '%2'}, clear=False), \
+                     patch.object(TEAM, 'owned', return_value=True), \
+                     patch.object(TEAM, 'codex_preflight'), \
+                     patch.object(TEAM.subprocess, 'call', return_value=0) as execute:
+                    TEAM.run_pane(directory, 'worker_a', 'saved-session')
+                args = execute.call_args.args[0]
+                env = execute.call_args.kwargs['env']
+                self.assertEqual(env['AGENT_TEAM_DIR'], root)
+                self.assertEqual(env['AGENT_TEAM_ROLE'], 'worker_a')
+                self.assertIn('worker-model', args if tool != 'opencode' else env['OPENCODE_CONFIG_CONTENT'])
+                self.assertNotIn('old assignment', args)
+                self.assertNotIn('old prompt', args)
+                self.assertNotIn('--dangerously-bypass-approvals-and-sandbox', args)
+                self.assertEqual(args[-2:], (['resume', 'saved-session'] if tool == 'codex' else
+                                              ['-s', 'saved-session'] if tool == 'opencode' else
+                                              ['--resume', 'saved-session']))
+
+    def test_restored_lead_preserves_explicit_permission_options(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            (directory / 'ready').touch()
+            TEAM.write(directory / 'state.json', {
+                'id': 'test', 'tool': 'codex', 'cwd': root, 'budget': False,
+                'config': {'limit': 2, 'yolo': False},
+                'extra': ['--sandbox', 'read-only', '--ask-for-approval', 'never', 'original prompt'],
+                'members': {'lead': {'pane': '%1', 'status': 'running'}}})
+            with patch.dict(os.environ, {'TMUX_PANE': '%1'}, clear=False), \
+                 patch.object(TEAM, 'owned', return_value=True), \
+                 patch.object(TEAM, 'codex_preflight') as preflight, \
+                 patch.object(TEAM.subprocess, 'call', return_value=0) as execute:
+                TEAM.run_pane(directory, 'lead', 'saved-session')
+            args = execute.call_args.args[0]
+            self.assertEqual(args[args.index('--sandbox') + 1], 'read-only')
+            self.assertEqual(args[args.index('--ask-for-approval') + 1], 'never')
+            self.assertNotIn('original prompt', args)
+            self.assertNotIn('--dangerously-bypass-approvals-and-sandbox', args)
+            preflight.assert_called_once()
+            self.assertTrue(TEAM.read(directory / 'state.json')['closed'])
+
     def test_trae_scenes_use_highest_advertised_effort_for_every_role(self):
         for scene in TEAM.scene_names('traex'):
             for team in (False, True):
