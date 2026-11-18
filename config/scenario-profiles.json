@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "modeldial_close_points": 1.0,
+  "desktop_close_points": 1.0,
+  "scenes": [
+    {
+      "id": "daily",
+      "label": "日常开发",
+      "source": "modeldial",
+      "axes": {"backend": 0.55, "frontend": 0.35, "knowledge": 0.10},
+      "lead": {"cost": 2.0, "time": 1.0},
+      "worker": {"cost": 5.0, "time": 2.0}
+    },
+    {
+      "id": "computer",
+      "label": "电脑自动化",
+      "source": "cua",
+      "lead": {"cost": 4.0, "time": 2.0},
+      "worker": {"cost": 5.0, "time": 2.0}
+    },
+    {
+      "id": "hard",
+      "label": "难题攻坚",
+      "source": "terminal_bench",
+      "worker_source": "modeldial",
+      "axes": {"backend": 0.55, "frontend": 0.35, "knowledge": 0.10},
+      "worker": {"cost": 5.0, "time": 2.0}
+    },
+    {
+      "id": "background",
+      "label": "后台可验证小任务",
+      "source": "modeldial",
+      "axes": {"backend": 0.80, "frontend": 0.20},
+      "lead": {"cost": 12.0, "time": 1.0},
+      "worker": {"cost": 18.0, "time": 1.5}
+    }
+  ]
+}

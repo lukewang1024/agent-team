@@ -352,7 +352,7 @@ class AdapterTests(unittest.TestCase):
             TEAM.main()
         launch.assert_called_once_with(['--team', '--tmux'], tool='claude')
 
-    def test_picker_uses_available_codex_recommendations_without_default_option(self):
+    def test_picker_uses_available_codex_recommendations(self):
         url = TEAM.codex_radar_options()['url']
         cache = {
             'version': 2,
@@ -367,12 +367,28 @@ class AdapterTests(unittest.TestCase):
                 patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \
                 patch.object(TEAM.shutil, 'which', side_effect=lambda name: '/bin/tool' if name == 'codex' else None), \
                 patch('builtins.input', side_effect=['1', '1', '2']), \
-                patch.object(TEAM, 'prepare_codex_radar_for_menu', return_value=cache), \
+                patch.object(TEAM, 'prepare_recommendations', return_value=cache), \
                 patch.object(TEAM, 'start_codex') as launch, \
                 contextlib.redirect_stdout(io.StringIO()):
             TEAM.main()
         launch.assert_called_once_with(
             ['--recommendation', 'blue-team-1234567890', '--team'], tool='codex')
+
+    def test_picker_offers_codex_defaults_and_shows_unavailable_computer_scene(self):
+        cache = {'unavailable_scenes': [{'key': 'computer', 'label': '电脑自动化'}], 'recommendations': {'items': [{
+            'id': 'daily-123', 'source_key': 'daily', 'label': 'daily',
+            'model': 'gpt-6.2-sol', 'effort': 'max'}]}}
+        with patch.object(TEAM.sys, 'argv', ['agent-team']), \
+                patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \
+                patch.object(TEAM.shutil, 'which', side_effect=lambda name: '/bin/tool' if name == 'codex' else None), \
+                patch('builtins.input', side_effect=['1', '0', '1']), \
+                patch.object(TEAM, 'prepare_recommendations', return_value=cache), \
+                patch.object(TEAM, 'start_codex') as launch, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            TEAM.main()
+        launch.assert_called_once_with([], tool='codex')
+        self.assertIn('电脑自动化 · 暂无推荐', output.getvalue())
+        self.assertIn('0. Codex defaults', output.getvalue())
 
     def test_picker_refresh_replaces_displayed_recommendation(self):
         url = TEAM.codex_radar_options()['url']
@@ -384,11 +400,11 @@ class AdapterTests(unittest.TestCase):
                 patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \
                 patch.object(TEAM.shutil, 'which', side_effect=lambda name: '/bin/tool' if name == 'codex' else None), \
                 patch('builtins.input', side_effect=['1', 'r', '1', '1']), \
-                patch.object(TEAM, 'prepare_codex_radar_for_menu', return_value=cache('old-1')), \
-                patch.object(TEAM, 'update_codex_radar_recommendations', return_value=(cache('new-2'), True)) as refresh, \
+                patch.object(TEAM, 'prepare_recommendations', side_effect=[cache('old-1'), cache('new-2')]), \
+                patch.object(TEAM, 'sync_all_benchmarks', return_value={'status': 'updated'}) as refresh, \
                 patch.object(TEAM, 'start_codex') as launch, contextlib.redirect_stdout(io.StringIO()):
             TEAM.main()
-        refresh.assert_called_once_with(force=True, strict=True)
+        refresh.assert_called_once_with(force=True)
         launch.assert_called_once_with(['--recommendation', 'new-2'], tool='codex')
 
     def test_picker_can_turn_off_recommended_fast(self):
@@ -399,7 +415,7 @@ class AdapterTests(unittest.TestCase):
                 patch.object(TEAM.sys.stdin, 'isatty', return_value=True), \
                 patch.object(TEAM.shutil, 'which', side_effect=lambda name: '/bin/tool' if name == 'codex' else None), \
                 patch('builtins.input', side_effect=['1', 'f', '1', '1']), \
-                patch.object(TEAM, 'prepare_codex_radar_for_menu', return_value=cache), \
+                patch.object(TEAM, 'prepare_recommendations', return_value=cache), \
                 patch.object(TEAM, 'start_codex') as launch, contextlib.redirect_stdout(io.StringIO()):
             TEAM.main()
         launch.assert_called_once_with(['--recommendation', 'daily-123', '--no-fast'], tool='codex')
@@ -444,21 +460,20 @@ class AdapterTests(unittest.TestCase):
         self.assertFalse(cfg['fast'])
         quick = TEAM.scene_settings('daily', True, 'quick', tool='traex')
         self.assertEqual((quick['model'], quick['effort']), ('gpt-6-astra', 'low'))
-    def test_check_without_available_recommendation_still_uses_codex_defaults(self):
+    def test_check_without_available_recommendation_fails_closed(self):
         with patch.object(TEAM, 'CODEX_RADAR_RUNTIME', False), \
                 patch.object(TEAM, 'CODEX_RADAR_MENU_CACHE', None), \
                 patch.object(TEAM, 'validate_scene_models') as validate, \
                 patch.object(TEAM.os, 'execvpe') as execute, \
-                contextlib.redirect_stdout(io.StringIO()) as output:
-            TEAM.start_codex(['--recommendation', 'missing-rec', '--team', '--check'])
-        validate.assert_called_once()
-        self.assertTrue(validate.call_args.args[1])
-        plan = json.loads(output.getvalue())
-        self.assertIsNone(plan['config']['recommendation_id'])
-        self.assertNotIn('model', plan['config'])
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, 'expired or unavailable'):
+                TEAM.start_codex(['--recommendation', 'missing-rec', '--team', '--check'])
+        validate.assert_not_called()
         execute.assert_not_called()
     def test_model_catalog_rejects_unavailable_models_efforts_and_fast(self):
-        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'CODEX_HOME': directory}):
+        original_catalog = TEAM.cached_codex_model_catalog
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {'CODEX_HOME': directory}), \
+                patch.object(TEAM, 'cached_codex_model_catalog', side_effect=lambda refresh=False: original_catalog()):
             cfg = TEAM.scene_settings('daily', True)
             # Missing optional tiers use Codex defaults and do not require its model catalog.
             TEAM.validate_scene_models(cfg, True)
@@ -468,7 +483,7 @@ class AdapterTests(unittest.TestCase):
                 TEAM.validate_scene_models(cfg, True)
             path = Path(directory) / 'models_cache.json'
             path.write_text(json.dumps({'models': []}))
-            with self.assertRaisesRegex(RuntimeError, 'no fallback'):
+            with self.assertRaisesRegex(RuntimeError, 'catalog is unavailable'):
                 TEAM.validate_scene_models(cfg, True)
             model = {'slug':'gpt-6.1-sol', 'supported_reasoning_levels':[{'effort':'max'}],
                      'additional_speed_tiers':['fast']}
@@ -528,7 +543,7 @@ class AdapterTests(unittest.TestCase):
                 self.assertNotIn('effort', cfg)
                 with contextlib.redirect_stdout(io.StringIO()) as output, \
                         contextlib.redirect_stderr(io.StringIO()):
-                    TEAM.start_codex(['--scene', 'daily', '--team', '--check'])
+                    TEAM.start_codex(['--team', '--check'])
                 plan = json.loads(output.getvalue())
                 self.assertNotIn('-m', plan['argv'])
                 self.assertFalse(any('model_reasoning_effort=' in arg for arg in plan['argv']))
@@ -556,6 +571,9 @@ class AdapterTests(unittest.TestCase):
     def test_recommended_fast_propagates_and_can_be_overridden(self):
         document = "<h2>站长推荐</h2><h3>日常开发</h3><p>GPT-6.1 Terra Max + Fast</p>"
         items = TEAM.normalize_codex_radar_html(document, TEAM.codex_radar_options())['items']
+        for item in items:
+            item.update(worker_model=item['model'], worker_effort=item['effort'],
+                        method=TEAM.RECOMMENDATION_METHOD, metrics={})
         cache = {'version': 2, 'source_url': TEAM.codex_radar_options()['url'],
                  'recommendations': {'items': items}}
         for team in (False, True):
@@ -707,7 +725,8 @@ class AdapterTests(unittest.TestCase):
                 start.assert_called_once()
 
             TEAM.write(TEAM.codex_radar_pending_cache_path(), new)
-            active = TEAM.prepare_codex_radar_for_menu()
+            with patch.object(TEAM, 'start_codex_radar_background_refresh', return_value=True):
+                active = TEAM.prepare_codex_radar_for_menu()
             self.assertEqual(active['recommendations']['items'][0]['model'], 'new-model')
             self.assertFalse(TEAM.codex_radar_pending_cache_path().exists())
 

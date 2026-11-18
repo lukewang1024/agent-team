@@ -73,48 +73,50 @@ is not enabled by the scene launcher. `--check` validates model and effort
 against `traex debug models` without making an inference request.
 `--adjust quick` explicitly switches Single/the lead to Astra low.
 
-## CodexRadar recommendations
+## Codex scenario recommendations
 
-The Codex Create Agent menu reads the remote station-recommendation cache. It
-shows all distinct categories in the source order and keeps the newest model
-version within each category. Category names and model/effort pairs remain
-remote-driven; an optional `menu_category_limit` can limit the CLI picker.
-Codex defaults are used only when no recommendations are available. Fast follows
-the selected recommendation when the website marks it `+ Fast`. Override it
-with `--no-fast` to save budget or `--fast` to enable it explicitly.
-
-The menu prepares recommendations only when Create Agent → Codex opens. It
-parses the homepage's Station Picks section. It fetches synchronously
-if no valid cache exists. When a valid cache is at least 24 hours old, it
-refreshes in the background and keeps using the active cache; a successful
-refresh is promoted on the next menu open. Direct Codex launches read the cache
-without fetching.
+Create Agent → Codex and the `agent-team` picker calculate model and thinking
+level recommendations using [ModelDial's Codex-local evaluations](https://modeldial.com/radar),
+[Terminal-Bench 4.1](https://www.tbench.ai/?version=4.1), and the
+[CUA-Speedrun desktop results](https://cuaspeedrun.com/results.html). Each
+scenario uses the relevant source, with exact model/effort matches. These
+benchmarks measure different tasks and are not pooled into an IQ score.
+ModelDial Public Radar data is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/);
+our scenario calculations modify the data and are not endorsed by ModelDial.
+The publication batch and timestamp are included in `recommendations status`.
+The method, assumptions, role-specific coefficients, and limitations are in
+[model-recommendation-methodology.md](docs/model-recommendation-methodology.md).
+The recommendation status includes the full evidence snapshot and scoring
+trace. Missing sources or unsupported model/effort pairs are shown as
+unavailable. Codex defaults remain selectable. The background choice is only
+for bounded work with a checkable result; escalate ambiguous or failed work.
 
 ```sh
 agent-team recommendations status
-agent-team start codex --recommendation <ID>
-agent-team start codex --recommendation <ID> --team
+agent-team recommendations refresh
+agent-team start codex --recommendation <ID> --team --dry-run
 agent-team start codex --recommendation <ID> --team --tmux
-agent-team start codex --recommendation <ID> --fast
-agent-team start codex --recommendation <ID> --no-fast
-agent-team start codex --team --dry-run
+agent-team benchmarks status
+agent-team recommendations schedule enable
+agent-team recommendations schedule status
+agent-team recommendations sync --force
+agent-team recommendations schedule disable
 ```
 
-Use the `id` from `agent-team recommendations status` when selecting a
-recommendation directly. Cache files live under `$XDG_CACHE_HOME/agent-team`
-(default `~/.cache/agent-team`). If the first fetch fails or returns no usable
-recommendations, the menu shows no hard-coded Codex tiers and still allows
-Codex to start with its native defaults. A failed refresh is retried after five
-minutes on a later menu visit, while retaining any previous recommendations. Missing or stale recommendation data never
-blocks agent creation.
+Use an `id` from `recommendations status`. Recommendations select the normal
+service tier; `--fast` and `--no-fast` explicitly override it. `--check`
+validates both selected pairs against the current CLI catalog without inference.
+An unavailable or expired explicit ID fails rather than silently launching a
+different pair. When no selection is made Codex uses its defaults. The menu
+uses the last successful source snapshot and retains recent generations so a
+background refresh or a second menu does not change an existing choice.
 
-Trae retains its daily, hard and batch scenes. `--adjust quick` is a Trae-only
-option and selects Astra low. Trae model/effort settings are checked against
-`traex debug models` when requested. CodexRadar recommendations can be checked
-with `agent-team recommendations status` or refreshed manually with
-`agent-team recommendations refresh`. Press `r` in the interactive Codex
-recommendation picker to refresh immediately, or `f` to toggle Fast off. The
-Workbench Create Agent menu offers the same budget override.
+The optional Linux systemd user timer checks every five minutes, fetches each
+source at most daily, and retries a failed source after five minutes. Each
+source retains its last good evidence independently. The scheduler saves the inherited PATH, proxy and
+XDG variables in a mode-0600 user file; rerun `schedule enable` if they change.
+Other environments can schedule `agent-team recommendations sync` directly.
+The CLI picker can refresh with `r` and toggle Fast off with `f`.
 
 Team defaults to YOLO; `--no-yolo` inherits CLI permissions for the entire team.
 For Codex and Trae, `--yolo` explicitly enables YOLO for Single or Team, including
@@ -155,10 +157,9 @@ The combined level is the model tier followed by the thinking rank: Luna (1),
 Terra (2), Sol (3), Astra (4); low (1), medium (2), high (3), xhigh (4), max (5),
 ultra (6). For example, Sol max is 3.5 and Astra xhigh is 4.4. A Sol high lead
 (3.3) can use Sol high or any lower combined level, but cannot use Sol xhigh or
-any Astra model. Defaults offer only the latest model generation configured for
-each CLI and tier. Codex also considers newer generations in the active
-CodexRadar cache for worker choices, while the selected main-agent recommendation
-remains the exact CodexRadar model/effort pair. Model-family suffixes map to the
+any Astra model. Defaults offer the latest configured model generation for each CLI and tier.
+For a measured Codex recommendation, the lead and default worker remain pinned
+to their calculated pairs and other measured candidates can also be offered. Model-family suffixes map to the
 Luna/Terra/Sol/Astra tiers, including future versioned names such as `gpt-7-sol`.
 Trae retains its configured GPT-5.6 Luna default because its current catalog has
 no GPT-6 Luna. These mappings are listed in
@@ -203,13 +204,13 @@ and delegation rules are independent of model choices. Other tools have no
 assumed budget model: configure a distinct budget combination when desired.
 There is no automatic budget switching.
 
-Codex model and effort choices come from the selected CodexRadar recommendation;
+Codex model and effort choices come from the selected recommendation;
 Codex scenes are not locally configured. The selected recommendation supplies
 the lead pair, and `worker_model` / `worker_effort` remain the default pair for
-per-task subagent selection in configured team presets. The lead receives the
-launch-time cached scene recommendations that fit its ceiling and available
-model descriptions from the local Codex catalog, and should match them to each
-subtask. When the catalog advertises supported effort levels for a model,
+per-task subagent selection in configured team presets. The lead receives
+recommendations calculated from the launch-time measurements and only pairs
+that fit its ceiling, plus model descriptions from the local Codex catalog; it
+should match them to each subtask. When the catalog advertises supported effort levels for a model,
 worker choices omit other levels; a stale catalog is advisory. Unknown and above-ceiling pairs are omitted. These are
 advisory, and native routing remains instruction-driven. Set `codex.team.limit`
 in the override file to change its worker cap.
@@ -217,9 +218,8 @@ To rank a custom model or alias, add its positive integer tier under
 `model_tiers` in `$XDG_CONFIG_HOME/agent-team/model-levels.json`. Add a
 `model_families` suffix when a provider introduces versioned model names that
 share a family tier. Add a `latest_models` list for other tools when their
-default choices should use a specific newest model per tier. Codex uses the
-newest model per tier from the active CodexRadar cache, with this list as its
-fallback. The original flat `{model: tier}` override format remains accepted.
+default choices should use a specific newest model per tier. For ordinary non-recommended teams, Codex uses the newest model per tier
+from the active recommendations, with this list as its fallback. The original flat `{model: tier}` override format remains accepted.
 When two different models cannot be ranked, team launch or worker spawn fails
 closed.
 Trae scene overrides remain available under `traex.scenes.<scene>` in

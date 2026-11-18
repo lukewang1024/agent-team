@@ -6,6 +6,7 @@ import hashlib
 import http.client
 from html.parser import HTMLParser
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -268,6 +269,195 @@ def normalize_codex_radar_html(document, options):
     return normalized
 
 
+class CodexRadarTradeoffsParser(HTMLParser):
+    """Read the published data for the same cohort as the trade-off table."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.collecting = False
+        self.payloads = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "script" and any(key == "data-mtr-payload" for key, _ in attrs):
+            self.collecting = True
+            self.payloads.append([])
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            self.collecting = False
+
+    def handle_data(self, data):
+        if self.collecting:
+            self.payloads[-1].append(data)
+
+
+def normalize_codex_radar_tradeoffs(document):
+    parser = CodexRadarTradeoffsParser()
+    parser.feed(document)
+    parser.close()
+    if len(parser.payloads) != 1:
+        fail("Codex Radar trade-off data is missing or ambiguous")
+    payload = json.loads("".join(parser.payloads[0]))
+    if not isinstance(payload, dict) or payload.get("schema") != "codex-model-tradeoffs/2":
+        fail("Unsupported Codex Radar trade-off schema")
+    definition = payload.get("composite_definition")
+    if (not isinstance(definition, dict) or definition.get("time_exponent") != 2
+            or definition.get("reference_usd") != 1 or definition.get("reference_minutes") != 10):
+        fail("Unsupported Codex Radar composite cost definition")
+    if not all(isinstance(payload.get(key), str) and payload[key] for key in ("round_id", "protocol")):
+        fail("Codex Radar trade-off data has no batch identity")
+    source_rows = payload.get("rows")
+    if not isinstance(source_rows, list):
+        fail("Codex Radar trade-off data has no rows")
+    if len(source_rows) > 512:
+        fail("Codex Radar trade-off data exceeds the 512-row limit")
+    rows = []
+    seen = set()
+    for row in source_rows:
+        if not isinstance(row, dict):
+            continue
+        model, effort = row.get("model"), row.get("effort")
+        metrics, availability = row.get("chart_metrics"), row.get("availability")
+        if (not isinstance(model, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", model)
+                or not isinstance(effort, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,23}", effort)
+                or not isinstance(metrics, dict) or not isinstance(availability, dict)
+                or availability.get("cost") is not True or availability.get("time") is not True
+                or availability.get("composite") is not True):
+            continue
+        score = metrics.get("score150")
+        cost = metrics.get("api_equivalent_usd_per_task")
+        minutes = metrics.get("end_to_end_minutes_per_task")
+        published_composite = metrics.get("composite_cost_index")
+        if (any(type(value) not in (int, float) or not math.isfinite(value)
+                for value in (score, cost, minutes, published_composite))
+                or not 0 <= score <= 150 or cost < 0 or minutes <= 0 or published_composite < 0):
+            continue
+        try:
+            composite = cost * (minutes / 10) ** 2
+        except OverflowError:
+            continue
+        if not math.isfinite(composite) or not math.isclose(composite, published_composite, rel_tol=1e-6, abs_tol=1e-12):
+            continue
+        pair = (model, effort)
+        if pair in seen:
+            fail("Codex Radar trade-off data contains duplicate model/effort pairs")
+        seen.add(pair)
+        rows.append({"model": model, "effort": effort, "score150": score,
+                     "cost_usd_per_task": cost, "minutes_per_task": minutes})
+    if len(rows) < 2:
+        fail("Codex Radar trade-off data contains fewer than two comparable rows")
+    return {"schema": payload["schema"], "round_id": payload["round_id"],
+            "protocol": payload["protocol"], "composite_definition": definition, "rows": rows}
+
+
+def codex_radar_composite(row):
+    try:
+        return row["cost_usd_per_task"] * (row["minutes_per_task"] / 10) ** 2
+    except OverflowError:
+        return math.inf
+
+
+def codex_radar_log_ratio(value, reference):
+    # Avoid overflow in value/reference while retaining accuracy near zero.
+    if value <= reference:
+        return math.log1p(value / reference)
+    return math.log(value) - math.log(reference) + math.log1p(reference / value)
+
+
+def codex_radar_frontier(rows, measure):
+    """The site's strict 2D Pareto rule: maximize score, minimize measure."""
+    return [a for a in rows if not any(
+        measure(b) <= measure(a) and b["score150"] >= a["score150"]
+        and (measure(b) < measure(a) or b["score150"] > a["score150"])
+        for b in rows)]
+
+
+def rank_codex_radar_tradeoffs(benchmark, catalog=None, allowed_pairs=None):
+    """Rank complete, comparable rows; a worker can further restrict the candidates."""
+    if not isinstance(benchmark, dict) or not isinstance(benchmark.get("rows"), list):
+        return []
+    catalog = catalog or {}
+    rows = []
+    for row in benchmark["rows"]:
+        if not isinstance(row, dict):
+            continue
+        model, effort = row.get("model"), row.get("effort")
+        score, cost, minutes = row.get("score150"), row.get("cost_usd_per_task"), row.get("minutes_per_task")
+        if (not isinstance(model, str) or not isinstance(effort, str)
+                or any(type(value) not in (int, float) or not math.isfinite(value) for value in (score, cost, minutes))
+                or not 0 <= score <= 150 or cost < 0 or minutes <= 0):
+            continue
+        if not math.isfinite(codex_radar_composite(row)):
+            continue
+        pair = (model_key(model), effort)
+        if allowed_pairs is not None and pair not in allowed_pairs:
+            continue
+        metadata = catalog.get(pair[0]) if catalog else None
+        if catalog and not isinstance(metadata, dict):
+            continue
+        levels = metadata.get("supported_reasoning_levels") if metadata else None
+        if isinstance(levels, list) and effort not in {entry.get("effort") for entry in levels if isinstance(entry, dict)}:
+            continue
+        rows.append(row)
+    if not rows:
+        return []
+
+    site_axes = {"cost": lambda row: row["cost_usd_per_task"],
+                 "time": lambda row: row["minutes_per_task"],
+                 "composite": codex_radar_composite}
+    site_frontiers = {name: {(row["model"], row["effort"]) for row in codex_radar_frontier(rows, measure)}
+                      for name, measure in site_axes.items()}
+    best_score = max(row["score150"] for row in rows)
+    profiles = read(CONFIG / "recommendation-profiles.json")["profiles"]
+    items = []
+    for profile in profiles:
+        floor = best_score * profile["min_quality_ratio"]
+        weights = profile["weights"]
+        def scene_cost(row):
+            cost = codex_radar_log_ratio(row["cost_usd_per_task"], 0.01) / math.log1p(100)
+            duration = math.log1p(row["minutes_per_task"]) / math.log1p(10)
+            composite = codex_radar_log_ratio(codex_radar_composite(row), 0.01) / math.log1p(100)
+            return weights["cost"] * cost + weights["time"] * duration + weights["composite"] * composite
+
+        eligible = [row for row in rows if row["score150"] >= floor]
+        scene_costs = {id(row): scene_cost(row) for row in eligible}
+        frontier = codex_radar_frontier(eligible, lambda row: scene_costs[id(row)])
+        candidates = [(weights["quality"] * row["score150"] / 150.0 - scene_costs[id(row)], row)
+                      for row in frontier]
+        candidates.sort(key=lambda item: (-item[0], -item[1]["score150"], item[1]["cost_usd_per_task"],
+                                          item[1]["minutes_per_task"], item[1]["model"], item[1]["effort"]))
+        if not candidates:
+            continue
+        utility, winner = candidates[0]
+        model, effort = winner["model"], winner["effort"]
+        suffix = hashlib.sha256((profile["id"] + "\0" + model + "\0" + effort).encode()).hexdigest()[:10]
+        metrics = {key: winner[key] for key in ("score150", "cost_usd_per_task", "minutes_per_task")}
+        metrics["composite_cost_index"] = codex_radar_composite(winner)
+        verified = bool(catalog and isinstance(levels_for(catalog, model), list))
+        label = (f"{profile['label']} · {model} {effort} · 算法(四题参考) "
+                 f"{metrics['score150']:.1f}/150 ${metrics['cost_usd_per_task']:.4g}/题 "
+                 f"{metrics['minutes_per_task']:.1f}分/题"
+                 + (" · 可用性未验证" if not verified else ""))
+        items.append({"id": "profile-" + profile["id"] + "-" + suffix,
+                      "source_key": profile["id"], "scene": profile["label"], "label": label,
+                      "model": model, "effort": effort, "fast": False, "method": "measured_pareto_v3",
+                      "metrics": metrics, "selection_score": round(utility, 6),
+                      "quality_floor": round(floor, 4), "weights": weights,
+                      "scene_cost": scene_costs[id(winner)],
+                      "site_frontiers": [name for name in site_axes if (model, effort) in site_frontiers[name]],
+                      "catalog_verified": verified,
+                      "alternatives": [{"model": choice["model"], "effort": choice["effort"],
+                                        "score150": choice["score150"],
+                                        "cost_usd_per_task": choice["cost_usd_per_task"],
+                                        "minutes_per_task": choice["minutes_per_task"]}
+                                       for _, choice in candidates[1:3]]})
+    return items
+
+
+def levels_for(catalog, model):
+    metadata = catalog.get(model_key(model), {})
+    return metadata.get("supported_reasoning_levels") if isinstance(metadata, dict) else None
+
+
 def read_codex_radar_cache(path=None):
     path = Path(path) if path else codex_radar_cache_path()
     try:
@@ -323,12 +513,44 @@ def codex_radar_error_detail(url, error):
     return codex_radar_url_label(url) + " (" + detail + ")"
 
 
+def codex_radar_attempt_time(cache):
+    value = cache.get("last_attempt_at", cache.get("fetched_at", 0)) if cache else 0
+    return value if type(value) in (int, float) and math.isfinite(value) else 0
+
+
+def codex_radar_data_time(cache):
+    value = cache.get("fetched_at") if cache else None
+    if type(value) in (int, float) and math.isfinite(value):
+        return value
+    return 0 if cache and cache.get("last_error") else codex_radar_attempt_time(cache)
+
+
+def merge_codex_radar_caches(options, candidates):
+    matches = [cache for cache in candidates if cache and cache.get("source_url") == options["url"]]
+    if not matches:
+        return None
+    latest_data = max(enumerate(matches), key=lambda pair: (codex_radar_data_time(pair[1]), pair[0]))[1]
+    latest_attempt = max(enumerate(matches), key=lambda pair: (codex_radar_attempt_time(pair[1]), pair[0]))[1]
+    if latest_attempt.get("last_error") and codex_radar_attempt_time(latest_attempt) > codex_radar_attempt_time(latest_data):
+        latest_data = dict(latest_data, last_error=latest_attempt["last_error"],
+                           last_attempt_at=codex_radar_attempt_time(latest_attempt),
+                           last_attempt_url=latest_attempt.get("last_attempt_url", options["url"]))
+    return latest_data
+
+
+def newest_codex_radar_cache(options):
+    # A successful staged fetch must remain the base for a later retry, even
+    # if the user has not opened the menu to promote it yet.
+    candidates = (read_codex_radar_cache(), read_codex_radar_cache(codex_radar_pending_cache_path()))
+    return merge_codex_radar_caches(options, candidates)
+
+
 def update_codex_radar_recommendations(force=False, strict=False, target="active"):
     if target not in ("active", "pending"):
         fail("Codex Radar cache target must be active or pending")
     options = codex_radar_options()
     now = time.time()
-    cache = read_codex_radar_cache()
+    cache = newest_codex_radar_cache(options) if target == "pending" else read_codex_radar_cache()
     if cache and cache.get("source_url") != options["url"]:
         cache = None
     interval = options.get("refresh_interval_seconds", 86400)
@@ -345,9 +567,31 @@ def update_codex_radar_recommendations(force=False, strict=False, target="active
         for scheme in ("http", "https")
     }
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({k: v for k, v in proxies.items() if v}))
+    catalog = None
     try:
         body = codex_radar_fetch(opener, options["url"], "text/html,application/xhtml+xml")
-        recommendations = normalize_codex_radar_html(body.decode("utf-8"), options)
+        document = body.decode("utf-8")
+        try:
+            station_recommendations = normalize_codex_radar_html(document, options)
+        except (ValueError, TypeError, KeyError, RuntimeError):
+            station_recommendations = {"items": []}
+        try:
+            benchmark = normalize_codex_radar_tradeoffs(document)
+            source_warning = None
+        except (ValueError, TypeError, KeyError, RuntimeError) as error:
+            if cache and isinstance(cache.get("benchmark"), dict):
+                fail("Trade-off data unavailable; retaining last measured batch: " + type(error).__name__)
+            benchmark = None
+            source_warning = "Trade-off data unavailable; using station picks: " + type(error).__name__
+        if benchmark:
+            catalog = cached_codex_model_catalog(refresh=True)
+            recommendations = {"items": rank_codex_radar_tradeoffs(benchmark, catalog)}
+            if not recommendations["items"]:
+                source_warning = "No measured model/effort pairs match the local Codex catalog"
+        else:
+            recommendations = station_recommendations
+        if not recommendations["items"] and not benchmark and not station_recommendations["items"]:
+            fail("Codex Radar homepage contains no usable trade-off data or station picks")
     except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, UnicodeError, ValueError, TypeError, KeyError, RuntimeError) as error:
         error_summary = codex_radar_error_detail(options["url"], error)
         if strict:
@@ -376,6 +620,12 @@ def update_codex_radar_recommendations(force=False, strict=False, target="active
         "fetched_from_url": options["url"],
         "source_format": "html",
         "recommendations": recommendations,
+        "station_recommendations": station_recommendations,
+        "benchmark": benchmark,
+        "source_warning": source_warning,
+        "model_catalog": compact_codex_model_catalog(catalog) if catalog is not None else None,
+        "catalog_warning": ("Current Codex model catalog unavailable; model availability is unverified"
+                            if benchmark and not catalog else None),
     }
     try:
         cache_path = codex_radar_pending_cache_path() if target == "pending" else codex_radar_cache_path()
@@ -384,6 +634,7 @@ def update_codex_radar_recommendations(force=False, strict=False, target="active
     except OSError:
         if strict:
             raise
+        return cache, False
     return cache, True
 
 
@@ -397,7 +648,7 @@ def codex_radar_refresh_lock_path():
     return codex_radar_cache_path().with_name("codexradar-recommendations.refresh.lock")
 
 
-def start_codex_radar_background_refresh():
+def acquire_codex_radar_refresh_lock():
     cache_path = codex_radar_cache_path()
     lock_path = codex_radar_refresh_lock_path()
     try:
@@ -427,62 +678,107 @@ def start_codex_radar_background_refresh():
             return False
         finally:
             os.close(descriptor)
-        try:
-            subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), "__refresh-codex-radar"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=environment({}),
-                close_fds=True,
-                start_new_session=True,
-            )
-        except OSError:
-            try:
-                lock_path.unlink()
-            except OSError:
-                pass
-            return False
         return True
     return False
+
+
+def release_codex_radar_refresh_lock():
+    try:
+        codex_radar_refresh_lock_path().unlink()
+    except FileNotFoundError:
+        pass
+
+
+def start_codex_radar_background_refresh():
+    if not acquire_codex_radar_refresh_lock():
+        return False
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "__refresh-codex-radar"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=environment({}),
+            close_fds=True,
+            start_new_session=True,
+        )
+    except OSError:
+        release_codex_radar_refresh_lock()
+        return False
+    return True
 
 
 def run_codex_radar_background_refresh():
     try:
         update_codex_radar_recommendations(force=True, target="pending")
     finally:
-        try:
-            codex_radar_refresh_lock_path().unlink()
-        except FileNotFoundError:
-            pass
+        release_codex_radar_refresh_lock()
+
+
+def codex_radar_refresh_due(cache, options, now):
+    has_data = codex_radar_has_data(cache)
+    interval = options.get("refresh_interval_seconds", 86400)
+    retry_interval = (options.get("failure_retry_interval_seconds", 300)
+                      if not has_data or (cache and (cache.get("last_error") or cache.get("source_warning")))
+                      else interval)
+    items = cache.get("recommendations", {}).get("items", []) if has_data else []
+    missing_fast = any(not isinstance(item.get("fast"), bool) for item in items if isinstance(item, dict))
+    needs_upgrade = bool(cache and "benchmark" not in cache)
+    return (not cache or ((missing_fast or needs_upgrade) and not cache.get("last_error"))
+            or now - codex_radar_attempt_time(cache) >= retry_interval)
+
+
+def sync_codex_radar_if_due(force=False):
+    # Also used by an external timer. Never replace the active menu snapshot
+    # while a user might be selecting one of its IDs.
+    if not acquire_codex_radar_refresh_lock():
+        return {"status": "busy"}
+    try:
+        options = codex_radar_options()
+        cache = newest_codex_radar_cache(options)
+        if not force and not codex_radar_refresh_due(cache, options, time.time()):
+            return {"status": "not_due"}
+        cache, updated = update_codex_radar_recommendations(force=True, target="pending")
+        if not updated:
+            return {"status": "failed", "error": cache.get("last_error", "could not save Radar data")}
+        return {"status": "updated", "fetched_at": cache.get("fetched_at")}
+    finally:
+        release_codex_radar_refresh_lock()
 
 
 def promote_codex_radar_pending(options):
     pending_path = codex_radar_pending_cache_path()
-    pending = read_codex_radar_cache(pending_path)
-    if pending is None:
-        return read_codex_radar_cache()
-    active = read_codex_radar_cache()
-    if active and active.get("source_url") != options["url"]:
-        active = None
-    if pending.get("source_url") == options["url"]:
-        pending_time = pending.get("last_attempt_at", pending.get("fetched_at", 0))
-        active_time = active.get("last_attempt_at", active.get("fetched_at", 0)) if active else 0
-        if not isinstance(pending_time, (int, float)):
-            pending_time = 0
-        if not isinstance(active_time, (int, float)):
-            active_time = 0
-        if active is None or pending_time >= active_time:
-            try:
-                write(codex_radar_cache_path(), pending)
-                active = pending
-            except OSError:
-                return active
+    claimed_path = pending_path.with_name(pending_path.name + "." + uuid.uuid4().hex + ".claimed")
     try:
-        pending_path.unlink()
+        # Claim exactly one generation. A concurrent writer can safely publish
+        # a newer pending file while this one is being promoted.
+        pending_path.replace(claimed_path)
     except OSError:
-        pass
-    return active
+        return read_codex_radar_cache()
+    keep_claimed = False
+    try:
+        pending = read_codex_radar_cache(claimed_path)
+        active = read_codex_radar_cache()
+        if active and active.get("source_url") != options["url"]:
+            active = None
+        selected = merge_codex_radar_caches(options, (active, pending))
+        if selected and selected != active:
+            try:
+                write(codex_radar_cache_path(), selected)
+                active = selected
+            except OSError:
+                try:
+                    # Do not overwrite a newer pending generation.
+                    os.link(claimed_path, pending_path)
+                except FileExistsError:
+                    pass
+                except OSError:
+                    keep_claimed = True
+                    raise
+        return active
+    finally:
+        if not keep_claimed:
+            claimed_path.unlink(missing_ok=True)
 
 
 def prepare_codex_radar_for_menu():
@@ -494,16 +790,31 @@ def prepare_codex_radar_for_menu():
         cache, _ = update_codex_radar_recommendations(force=True)
         return cache
 
-    last_attempt = cache.get("last_attempt_at", cache.get("fetched_at", 0))
-    if not isinstance(last_attempt, (int, float)):
-        last_attempt = 0
+    # Workbench reads this file directly. Recompute against the current local
+    # catalog before returning, and publish the same IDs used by the launcher.
+    if isinstance(cache.get("benchmark"), dict):
+        catalog = cached_codex_model_catalog(refresh=True)
+        calculated = {"items": rank_codex_radar_tradeoffs(cache["benchmark"], catalog)}
+        compact_catalog = compact_codex_model_catalog(catalog)
+        catalog_warning = ("Current Codex model catalog unavailable; model availability is unverified"
+                           if not catalog else None)
+        no_match_warning = "No measured model/effort pairs match the local Codex catalog"
+        warning = cache.get("source_warning")
+        if not calculated["items"]:
+            warning = no_match_warning
+        elif warning == no_match_warning:
+            warning = None
+        if (calculated != cache.get("recommendations") or warning != cache.get("source_warning")
+                or compact_catalog != cache.get("model_catalog") or catalog_warning != cache.get("catalog_warning")):
+            cache = dict(cache, recommendations=calculated, source_warning=warning,
+                         model_catalog=compact_catalog, catalog_warning=catalog_warning)
+            try:
+                write(codex_radar_cache_path(), cache)
+            except OSError:
+                pass
+
     has_data = codex_radar_has_data(cache)
-    interval = options.get("refresh_interval_seconds", 86400)
-    retry_interval = (options.get("failure_retry_interval_seconds", 300)
-                      if not has_data or cache.get("last_error") else interval)
-    missing_fast = has_data and any(not isinstance(item.get("fast"), bool)
-                                    for item in cache["recommendations"]["items"] if isinstance(item, dict))
-    if (missing_fast and not cache.get("last_error")) or time.time() - last_attempt >= retry_interval:
+    if codex_radar_refresh_due(cache, options, time.time()):
         if has_data:
             start_codex_radar_background_refresh()
         else:
@@ -525,6 +836,9 @@ def apply_codex_radar_recommendation(target, recommendation, key, updated_at, te
     target["recommendation_source"] = "codexradar.com"
     target["recommendation_key"] = recommendation.get("source_key", key)
     target["recommendation_updated_at"] = updated_at
+    if recommendation.get("method"):
+        target["recommendation_method"] = recommendation["method"]
+        target["recommendation_metrics"] = recommendation.get("metrics")
 
 
 def recommendation_timestamp(cache):
@@ -538,8 +852,27 @@ def recommendation_timestamp(cache):
 
 def codex_radar_command(argv):
     parser = argparse.ArgumentParser(prog="agent-team recommendations")
-    parser.add_argument("action", choices=("status", "refresh", "prepare"))
+    parser.add_argument("action", choices=("status", "refresh", "prepare", "sync", "schedule"))
+    parser.add_argument("schedule_action", nargs="?", choices=("enable", "disable", "status"))
+    parser.add_argument("--force", action="store_true", help="fetch now when using sync")
     args = parser.parse_args(argv)
+    if args.force and args.action != "sync":
+        parser.error("--force is only valid with sync")
+    if args.action == "schedule":
+        if not args.schedule_action:
+            parser.error("schedule requires enable, disable or status")
+        sys.path.insert(0, str(ROOT))
+        import radar_scheduler
+        if args.schedule_action == "enable":
+            result = radar_scheduler.enable(Path(__file__).resolve(), Path(sys.executable).resolve(), os.environ)
+        elif args.schedule_action == "disable":
+            result = radar_scheduler.disable(os.environ)
+        else:
+            result = radar_scheduler.status(os.environ)
+        print(json.dumps(result, ensure_ascii=False))
+        return
+    if args.schedule_action:
+        parser.error("an extra argument is only valid with schedule")
     if args.action == "refresh":
         cache, _ = update_codex_radar_recommendations(force=True, strict=True)
         try:
@@ -548,6 +881,15 @@ def codex_radar_command(argv):
             pass
     elif args.action == "prepare":
         prepare_codex_radar_for_menu()
+        return
+    elif args.action == "sync":
+        result = sync_codex_radar_if_due(force=args.force)
+        # The two sources have separate caches and failure states: a bad
+        # benchmark fetch must never erase or block the Radar menu snapshot.
+        result["terminal_bench"] = sync_terminal_bench(force=args.force)
+        print(json.dumps(result, ensure_ascii=False))
+        if result["status"] == "failed":
+            fail("CodexRadar scheduled refresh failed: " + result["error"])
         return
     else:
         cache = read_codex_radar_cache()
@@ -567,11 +909,441 @@ def codex_radar_command(argv):
         "fetched_from_url": cache.get("fetched_from_url") if cache_matches_source else None,
         "source_format": cache.get("source_format") if cache_matches_source else None,
         "source_warning": cache.get("source_warning") if cache_matches_source else None,
+        "catalog_warning": cache.get("catalog_warning") if cache_matches_source else None,
         "recommendations": cache.get("recommendations", {}) if cache_matches_source else {},
+        "station_recommendations": cache.get("station_recommendations", {}) if cache_matches_source else {},
+        "benchmark": cache.get("benchmark") if cache_matches_source else None,
         "last_error": cache.get("last_error") if cache else None,
         "last_error_endpoint": failed_endpoint,
     }
+    pending = read_codex_radar_cache(codex_radar_pending_cache_path())
+    if pending and pending.get("source_url") == options["url"]:
+        result["pending_refresh"] = {
+            "updated_at": recommendation_timestamp(pending),
+            "last_attempt_at": codex_radar_attempt_time(pending),
+            "last_error": pending.get("last_error"),
+            "source_warning": pending.get("source_warning"),
+        }
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def terminal_bench_module():
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    # A scheduled refresh should not leave interpreter caches in the checkout.
+    old_bytecode_setting = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        import terminal_bench
+    finally:
+        sys.dont_write_bytecode = old_bytecode_setting
+    return terminal_bench
+
+
+def sync_terminal_bench(force=False):
+    module = terminal_bench_module()
+    request_environment = environment({})
+    proxies = {
+        scheme: request_environment.get(scheme + "_proxy") or request_environment.get(scheme.upper() + "_PROXY")
+        for scheme in ("http", "https")
+    }
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({k: v for k, v in proxies.items() if v}))
+    try:
+        return module.sync(force=force, opener=opener)
+    except OSError as exc:
+        return {"status": "failed", "error": type(exc).__name__}
+
+
+def coding_benchmark_command(argv):
+    parser = argparse.ArgumentParser(prog="agent-team benchmarks")
+    parser.add_argument("action", choices=("status", "refresh"))
+    args = parser.parse_args(argv)
+    module = terminal_bench_module()
+    if args.action == "refresh":
+        refresh = sync_terminal_bench(force=True)
+        if refresh["status"] == "failed":
+            fail("Terminal-Bench refresh failed: " + refresh["error"])
+        if refresh["status"] != "updated":
+            fail("Terminal-Bench refresh is already in progress")
+    cache = module.read_cache()
+    benchmark = cache.get("benchmark") if cache else None
+    catalog = cached_codex_model_catalog(refresh=True) if isinstance(benchmark, dict) else None
+    ranked = module.rank(benchmark, catalog) if isinstance(benchmark, dict) else []
+    measured = {(row["model"], row["effort"]) for row in benchmark.get("rows", [])} if benchmark else set()
+    missing = []
+    for model, metadata in sorted((catalog or {}).items()):
+        if not model.startswith("gpt-") or not isinstance(metadata, dict):
+            continue
+        for level in metadata.get("supported_reasoning_levels", []):
+            effort = level.get("effort") if isinstance(level, dict) else None
+            if isinstance(effort, str) and (model, effort) not in measured:
+                missing.append({"model": model, "effort": effort})
+    print(json.dumps({
+        "source": module.SOURCE,
+        "board": module.BOARD,
+        "cache_file": str(module.cache_path()),
+        "fetched_at": cache.get("fetched_at") if cache else None,
+        "last_attempt_at": cache.get("last_attempt_at") if cache else None,
+        "last_error": cache.get("last_error") if cache else None,
+        "catalog_verified": bool(catalog),
+        "method": LEGACY_RECOMMENDATION_METHOD,
+        "scope": "Coding-terminal evidence only; computer automation is not measured",
+        "unmeasured_catalog_pairs": missing,
+        "profiles": ranked,
+        "computer_automation": {"status": "not_measured_by_terminal_bench",
+                                "reason": "See recommendations status for the separate desktop sources"},
+    }, ensure_ascii=False, indent=2))
+
+
+LEGACY_RECOMMENDATION_METHOD = "terminal-bench-4.1-pareto-v1"
+RECOMMENDATION_METHOD = "scenario-multisource-v2"
+
+
+def extra_benchmarks_module():
+    terminal_bench_module()  # Add the repository root before imports.
+    old_bytecode_setting = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        import benchmark_sources
+    finally:
+        sys.dont_write_bytecode = old_bytecode_setting
+    return benchmark_sources
+
+
+def scenario_engine_module():
+    terminal_bench_module()
+    old_bytecode_setting = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        import scenario_engine
+    finally:
+        sys.dont_write_bytecode = old_bytecode_setting
+    return scenario_engine
+
+
+def scenario_profiles():
+    profiles = read(CONFIG / "scenario-profiles.json")
+    if not isinstance(profiles, dict) or profiles.get("version") != 1 or not isinstance(profiles.get("scenes"), list):
+        fail("Invalid scenario recommendation profiles")
+    names = set()
+    for profile in profiles["scenes"]:
+        if (not isinstance(profile, dict) or profile.get("id") in names
+                or not isinstance(profile.get("label"), str) or not profile.get("id")):
+            fail("Invalid scenario recommendation profile")
+        names.add(profile["id"])
+        axes = profile.get("axes")
+        if axes is not None and (not isinstance(axes, dict) or not axes or
+                any(key not in ("backend", "frontend", "knowledge") or type(value) not in (int, float)
+                    or not math.isfinite(value) or value < 0 for key, value in axes.items()) or
+                abs(sum(axes.values()) - 1) > 1e-9):
+            fail("Scenario axis weights must add to one")
+        for role in ("lead", "worker"):
+            settings = profile.get(role)
+            if role == "lead" and profile.get("source") == "terminal_bench":
+                continue
+            if (not isinstance(settings, dict) or any(type(settings.get(key)) not in (int, float)
+                    or not math.isfinite(settings[key]) or settings[key] < 0 for key in ("cost", "time"))):
+                fail("Scenario cost and time weights must be nonnegative numbers")
+    for key in ("modeldial_close_points", "desktop_close_points"):
+        if type(profiles.get(key)) not in (int, float) or not math.isfinite(profiles[key]) or profiles[key] < 0:
+            fail("Scenario close-call margins must be nonnegative numbers")
+    return profiles
+
+
+def sync_extra_benchmarks(names=None, force=False):
+    import concurrent.futures
+    module = extra_benchmarks_module()
+    names = list(module.SOURCES) if names is None else list(names)
+    request_environment = environment({})
+    proxies = {scheme: request_environment.get(scheme + "_proxy") or request_environment.get(scheme.upper() + "_PROXY")
+               for scheme in ("http", "https")}
+
+    def fetch(name):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({k: v for k, v in proxies.items() if v}))
+        try:
+            return module.sync(name, force=force, opener=opener)
+        except OSError as exc:
+            return {"status": "failed", "error": type(exc).__name__}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(names))) as pool:
+        return dict(zip(names, pool.map(fetch, names)))
+
+
+def source_evidence():
+    terminal = terminal_bench_module().read_cache()
+    extra = extra_benchmarks_module()
+    caches = {"terminal_bench": terminal, **{name: extra.read_cache(name) for name in extra.SOURCES}}
+    benchmarks = {name: cache["benchmark"] for name, cache in caches.items()
+                  if isinstance(cache, dict) and isinstance(cache.get("benchmark"), dict)}
+    status = {name: {"fetched_at": cache.get("fetched_at"), "last_error": cache.get("last_error"),
+                     "last_attempt_at": cache.get("last_attempt_at")}
+              if isinstance(cache, dict) else {"fetched_at": None, "last_error": None}
+              for name, cache in caches.items()}
+    return benchmarks, status
+
+
+def sync_all_benchmarks(force=False):
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        terminal = pool.submit(sync_terminal_bench, force=force)
+        extra = pool.submit(sync_extra_benchmarks, force=force)
+        results = {"terminal_bench": terminal.result(), **extra.result()}
+    states = [value.get("status") for value in results.values()]
+    state = ("failed" if all(value == "failed" for value in states) else
+             "partial" if "failed" in states else "updated" if "updated" in states else
+             "busy" if "busy" in states else "not_due")
+    return {"status": state, "sources": results}
+
+
+def recommendation_cache_path():
+    return Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "agent-team/recommendations.json"
+
+
+def read_recommendation_cache():
+    try:
+        cache = read(recommendation_cache_path())
+        return cache if isinstance(cache, dict) and cache.get("version") == 2 else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def recommendation_items(cache):
+    if not isinstance(cache, dict):
+        return []
+    items = cache.get("recommendations", {}).get("items", [])
+    return [item for item in items if isinstance(item, dict) and all(
+        isinstance(item.get(key), str) and item[key] for key in ("id", "model", "effort"))] if isinstance(items, list) else []
+
+
+def worker_pairs_for_lead(benchmark, lead, policy=None):
+    """Filter measured pairs using the same combined ceiling as team policy."""
+    policy = policy if policy is not None else model_policy_config()
+    lead_tier = model_tier(lead["model"], policy)
+    lead_rank = policy["thinking_levels"].get(lead["effort"])
+    if lead_rank is None:
+        return set()
+    pairs = set()
+    for row in benchmark.get("rows", []):
+        if not isinstance(row, dict):
+            continue
+        model, effort = row.get("model"), row.get("effort")
+        if not isinstance(model, str) or not isinstance(effort, str):
+            continue
+        tier, rank = model_tier(model, policy), policy["thinking_levels"].get(effort)
+        if rank is None:
+            continue
+        if lead_tier is None:
+            eligible = model_key(model) == model_key(lead["model"]) and rank <= lead_rank
+        else:
+            eligible = tier is not None and tier * 10 + rank <= lead_tier * 10 + lead_rank
+        if eligible:
+            pairs.add((model, effort))
+    return pairs
+
+
+def calculate_recommendations(benchmark, catalog, fetched_at=None):
+    """Calculate both roles from one immutable evidence and catalog snapshot."""
+    module = terminal_bench_module()
+    policy = model_policy_config()
+    valid_leads = {(r["model"], r["effort"]) for r in benchmark.get("rows", [])
+                   if isinstance(r, dict) and isinstance(r.get("model"), str)
+                   and isinstance(r.get("effort"), str) and model_tier(r["model"], policy) is not None
+                   and r["effort"] in policy["thinking_levels"]}
+    fingerprint = hashlib.sha256(json.dumps({"method": LEGACY_RECOMMENDATION_METHOD, "benchmark": benchmark,
+                                              "catalog": catalog, "policy": policy,
+                                              "lead_profiles": module.PROFILES,
+                                              "worker_profiles": module.WORKER_PROFILES},
+                                             sort_keys=True).encode()).hexdigest()[:12]
+    items = []
+    for profile in module.rank(benchmark, catalog, valid_leads, role="lead"):
+        lead = profile["candidates"][0]
+        workers = module.rank(benchmark, catalog, worker_pairs_for_lead(benchmark, lead, policy), role="worker")
+        worker_profile = next((p for p in workers if p["scene"] == profile["scene"]), None)
+        if not worker_profile:
+            continue
+        worker = worker_profile["candidates"][0]
+        items.append({"id": profile["scene"] + "-" + fingerprint,
+                      "source_key": profile["scene"],
+                      "label": profile["label"] + " · " + lead["model"] + " / " + lead["effort"],
+                      "model": lead["model"], "effort": lead["effort"],
+                      "worker_model": worker["model"], "worker_effort": worker["effort"],
+                      "fast": False, "method": LEGACY_RECOMMENDATION_METHOD,
+                      "metrics": {"lead": profile, "worker": worker_profile}})
+    return {"version": 2, "source_url": module.SOURCE, "method": LEGACY_RECOMMENDATION_METHOD,
+            "snapshot_id": fingerprint, "fetched_at": fetched_at, "benchmark": benchmark,
+            "model_catalog": catalog, "model_policy": policy, "catalog_verified": bool(catalog),
+            "recommendations": {"items": items},
+            "unavailable_scenes": [{"key": "computer", "label": "电脑自动化",
+                                    "reason": "缺少同一桌面自动化基准的成本和耗时数据"}]}
+
+
+def calculate_scenario_recommendations(sources, catalog, source_status=None):
+    engine = scenario_engine_module()
+    profiles = scenario_profiles()
+    policy = model_policy_config()
+    all_rows = [row for benchmark in sources.values() if isinstance(benchmark, dict)
+                for row in benchmark.get("rows", []) if isinstance(row, dict)
+                and isinstance(row.get("model"), str) and isinstance(row.get("effort"), str)]
+    valid_pairs = {(row["model"], row["effort"]) for row in all_rows
+                   if model_tier(row["model"], policy) is not None
+                   and row["effort"] in policy["thinking_levels"]}
+    terminal_profiles = {"lead": terminal_bench_module().PROFILES,
+                         "worker": terminal_bench_module().WORKER_PROFILES}
+    fingerprint = hashlib.sha256(json.dumps({"method": RECOMMENDATION_METHOD, "sources": sources,
+                                             "catalog": catalog, "policy": policy, "profiles": profiles,
+                                             "terminal_profiles": terminal_profiles},
+                                            sort_keys=True).encode()).hexdigest()[:12]
+    items, unavailable = [], []
+    for profile in profiles["scenes"]:
+        lead_profile = engine.rank_scene(profile, sources, "lead", profiles, catalog, valid_pairs)
+        if not lead_profile:
+            unavailable.append({"key": profile["id"], "label": profile["label"],
+                                "reason": "缺少可比较的实测数据或本地支持档位"})
+            continue
+        lead = lead_profile["candidates"][0]
+        allowed = worker_pairs_for_lead({"rows": all_rows}, lead, policy)
+        worker_profile = engine.rank_scene(profile, sources, "worker", profiles, catalog, allowed)
+        if not worker_profile and profile["source"] == "terminal_bench":
+            fallback = dict(profile, worker_source="terminal_bench")
+            worker_profile = engine.rank_scene(fallback, sources, "worker", profiles, catalog, allowed)
+        if not worker_profile:
+            unavailable.append({"key": profile["id"], "label": profile["label"],
+                                "reason": "主档位下缺少可比较的工作档位"})
+            continue
+        worker = worker_profile["candidates"][0]
+        suggestions = []
+        for subtask in profiles["scenes"]:
+            ranked = engine.rank_scene(subtask, sources, "worker", profiles, catalog, allowed)
+            if ranked:
+                choice = ranked["candidates"][0]
+                suggestions.append({"id": subtask["id"], "label": subtask["label"],
+                                    "model": choice["model"], "effort": choice["effort"],
+                                    "source": ranked["source"]})
+        items.append({"id": profile["id"] + "-" + fingerprint, "source_key": profile["id"],
+                      "label": profile["label"] + " · " + lead["model"] + " / " + lead["effort"],
+                      "model": lead["model"], "effort": lead["effort"],
+                      "worker_model": worker["model"], "worker_effort": worker["effort"],
+                      "worker_recommendations": suggestions, "source_url": lead_profile["source_url"],
+                      "fast": False, "method": RECOMMENDATION_METHOD,
+                      "metrics": {"lead": lead_profile, "worker": worker_profile}})
+    return {"version": 2, "method": RECOMMENDATION_METHOD, "snapshot_id": fingerprint,
+            "sources": sources, "source_status": source_status or {}, "profiles": profiles,
+            "terminal_profiles": terminal_profiles,
+            "model_catalog": catalog, "model_policy": policy, "catalog_verified": bool(catalog),
+            "recommendations": {"items": items}, "unavailable_scenes": unavailable,
+            "attribution": {"modeldial": "ModelDial Public Radar; CC BY 4.0; calculations modified",
+                            "url": "https://modeldial.com/radar",
+                            "license": "https://creativecommons.org/licenses/by/4.0/"}}
+
+
+def prepare_recommendations(fetch_if_missing=True):
+    sources, status = source_evidence()
+    if fetch_if_missing:
+        missing = [name for name in extra_benchmarks_module().SOURCES if name not in sources]
+        if "terminal_bench" not in sources:
+            sync_terminal_bench()
+        if missing:
+            sync_extra_benchmarks(missing)
+        sources, status = source_evidence()
+    catalog = compact_codex_model_catalog(cached_codex_model_catalog(refresh=True)) if sources else {}
+    cache = calculate_scenario_recommendations(sources, catalog, status)
+    # Keep old menu IDs resolvable while another menu is open. Scheduled source
+    # updates do not publish menu snapshots; only preparation does so.
+    import fcntl
+    path = recommendation_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(path) + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        old = read_recommendation_cache()
+        history = old.get("history", []) if isinstance(old, dict) else []
+        history = [entry for entry in history if isinstance(entry, dict)] if isinstance(history, list) else []
+        if old and old.get("snapshot_id") != cache["snapshot_id"] and recommendation_items(old):
+            history.insert(0, {key: old.get(key) for key in
+                               ("snapshot_id", "fetched_at", "benchmark", "sources", "source_status", "profiles", "terminal_profiles",
+                                "model_catalog", "model_policy", "recommendations")})
+        cache["history"] = [entry for entry in history if entry.get("snapshot_id") != cache["snapshot_id"]][:12]
+        write(path, cache)
+    return cache
+
+
+def recommendation_settings(recommendation_id=None, team=False, cache=None):
+    cache = cache if cache is not None else (CODEX_RADAR_MENU_CACHE or read_recommendation_cache())
+    snapshot, item = None, None
+    for candidate in ([cache] + (cache.get("history", []) if isinstance(cache, dict) else [])):
+        selected = next((entry for entry in recommendation_items(candidate) if entry["id"] == recommendation_id), None)
+        if selected:
+            snapshot, item = candidate, selected
+            break
+    if recommendation_id and item is None:
+        fail("Recommendation expired or unavailable; reopen the menu to select a current recommendation")
+    cfg = codex_settings(team=team, cache={})
+    if item:
+        timestamp = recommendation_timestamp(snapshot)
+        if item.get("method") == RECOMMENDATION_METHOD:
+            source = item.get("metrics", {}).get("lead", {}).get("source")
+            source_names = ("cua_osworld", "cua_osworld2") if source == "cua" else (source,)
+            status = snapshot.get("source_status", {})
+            times = [status.get(name, {}).get("fetched_at") for name in source_names
+                     if isinstance(status.get(name), dict)]
+            times = [value for value in times if type(value) in (int, float) and math.isfinite(value)]
+            if times:
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(min(times)))
+        cfg.update(model=item["model"], effort=item["effort"], fast=item.get("fast", False),
+                   fast_explicit=True, recommendation_id=item["id"], recommendation_key=item["source_key"],
+                   recommendation_source=item.get("source_url", terminal_bench_module().SOURCE),
+                   recommendation_method=item["method"],
+                   recommendation_metrics=item["metrics"], recommendation_updated_at=timestamp)
+        if team:
+            cfg.update(worker_model=item["worker_model"], worker_effort=item["worker_effort"],
+                       worker_catalog=snapshot.get("model_catalog", {}))
+            if item["method"] == RECOMMENDATION_METHOD:
+                cfg["worker_recommendations"] = item.get("worker_recommendations", [])
+            else:
+                cfg["worker_benchmark"] = snapshot.get("benchmark")
+    return cfg
+
+
+def recommendation_command(argv):
+    parser = argparse.ArgumentParser(prog="agent-team recommendations")
+    parser.add_argument("action", choices=("status", "refresh", "prepare", "sync", "schedule"))
+    parser.add_argument("schedule_action", nargs="?", choices=("enable", "disable", "status"))
+    parser.add_argument("--force", action="store_true")
+    args = parser.parse_args(argv)
+    if args.force and args.action != "sync":
+        parser.error("--force is only valid with sync")
+    if args.action == "schedule":
+        if not args.schedule_action:
+            parser.error("schedule requires enable, disable or status")
+        sys.path.insert(0, str(ROOT))
+        import radar_scheduler
+        if args.schedule_action == "enable":
+            result = radar_scheduler.enable(Path(__file__).resolve(), Path(sys.executable).resolve(), os.environ)
+        elif args.schedule_action == "disable":
+            result = radar_scheduler.disable(os.environ)
+        else:
+            result = radar_scheduler.status(os.environ)
+        print(json.dumps(result, ensure_ascii=False))
+        return
+    if args.schedule_action:
+        parser.error("an extra argument is only valid with schedule")
+    if args.action == "sync":
+        result = sync_all_benchmarks(force=args.force)
+        print(json.dumps(result, ensure_ascii=False))
+        if result["status"] == "failed":
+            fail("All benchmark refreshes failed")
+        return
+    if args.action == "refresh":
+        result = sync_all_benchmarks(force=True)
+        if result["status"] == "failed":
+            fail("All benchmark refreshes failed")
+        if result["status"] == "busy":
+            fail("Benchmark refresh is already in progress")
+    if args.action == "prepare":
+        prepare_recommendations()
+        return
+    cache = prepare_recommendations(fetch_if_missing=False)
+    # Historical generations are used only to resolve existing menu choices.
+    print(json.dumps({key: value for key, value in cache.items() if key != "history"}, ensure_ascii=False, indent=2))
 
 
 SCENE_LABELS = {"daily": "日常开发", "hard": "复杂攻坚", "batch": "批量执行"}
@@ -739,7 +1511,8 @@ def validate_model_ceiling(main_model, main_effort, subagent_model, subagent_eff
 def latest_models_by_tier(policy, tool):
     candidates = list(policy["latest_models"].get(tool, []))
     if tool == "codex":
-        candidates.extend(item["model"] for item in codex_radar_items())
+        cache = CODEX_RADAR_MENU_CACHE or read_recommendation_cache()
+        candidates.extend(item["model"] for item in recommendation_items(cache))
     latest = {}
     for order, model in enumerate(candidates):
         tier = model_tier(model, policy)
@@ -754,6 +1527,9 @@ def latest_models_by_tier(policy, tool):
 
 def latest_worker_config(cfg, tool):
     result = dict(cfg)
+    # A measured recommendation pins its exact worker pair and evidence.
+    if result.get("recommendation_method") in (RECOMMENDATION_METHOD, LEGACY_RECOMMENDATION_METHOD):
+        return result
     policy = model_policy_config()
     current = result.get("worker_model") or result.get("model")
     if not current:
@@ -767,19 +1543,53 @@ def latest_worker_config(cfg, tool):
     return result
 
 
-def cached_codex_model_catalog():
-    path = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "models_cache.json"
+def cached_codex_model_catalog(refresh=False):
     try:
-        models = read(path).get("models", [])
+        if refresh:
+            # Let the selected CLI validate its own provider, identity and
+            # client version. A shared models_cache.json may belong to a
+            # different Codex process and is not a safe fallback here.
+            result = subprocess.run(["codex", "debug", "models"], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    text=True, timeout=4, env=environment({}))
+            if result.returncode or len(result.stdout) > 8 * 1024 * 1024:
+                return {}
+            models = json.loads(result.stdout).get("models", [])
+        else:
+            path = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "models_cache.json"
+            models = read(path).get("models", [])
         return {model_key(model["slug"]): model for model in models
                 if isinstance(model, dict) and isinstance(model.get("slug"), str)}
-    except (OSError, ValueError, TypeError, AttributeError):
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.TimeoutExpired):
         return {}
+
+
+def compact_codex_model_catalog(catalog):
+    """Retain only model metadata needed by launch and worker policy."""
+    result = {}
+    for model, metadata in catalog.items():
+        if not isinstance(model, str) or not isinstance(metadata, dict):
+            continue
+        entry = {}
+        levels = metadata.get("supported_reasoning_levels")
+        if isinstance(levels, list):
+            entry["supported_reasoning_levels"] = [
+                {"effort": level["effort"]} for level in levels
+                if isinstance(level, dict) and isinstance(level.get("effort"), str)]
+        tiers = metadata.get("additional_speed_tiers")
+        if isinstance(tiers, list):
+            entry["additional_speed_tiers"] = [tier for tier in tiers if isinstance(tier, str)]
+        description = metadata.get("description")
+        if isinstance(description, str):
+            entry["description"] = description[:4096]
+        result[model] = entry
+    return result
 
 
 def model_policy(cfg, tool, mode):
     main_model = cfg.get("model")
-    cfg = latest_worker_config(cfg, tool)
+    if cfg.get("recommendation_method") not in (RECOMMENDATION_METHOD, LEGACY_RECOMMENDATION_METHOD):
+        cfg = latest_worker_config(cfg, tool)
     policy = model_policy_config()
     lead_effort = cfg.get("effort") or policy["default_thinking_level"]
     default_model = cfg.get("worker_model") or main_model
@@ -793,11 +1603,26 @@ def model_policy(cfg, tool, mode):
         candidates = [latest[tier] for tier in sorted(latest)]
     else:
         candidates = list(dict.fromkeys(model for model in (default_model, main_model) if model))
-    catalog = cached_codex_model_catalog() if tool == "codex" else {}
+    if tool == "codex" and cfg.get("recommendation_method") == LEGACY_RECOMMENDATION_METHOD:
+        # Older measured pairs remain comparable candidates, not just the most
+        # recent model in each family. Availability and the ceiling still apply.
+        worker_benchmark = cfg.get("worker_benchmark")
+        worker_benchmark = worker_benchmark if isinstance(worker_benchmark, dict) else {}
+        candidates = list(dict.fromkeys(candidates + [row["model"] for row in
+            worker_benchmark.get("rows", []) if isinstance(row, dict)
+            and isinstance(row.get("model"), str)]))
+    if tool == "codex" and cfg.get("recommendation_method") == RECOMMENDATION_METHOD:
+        candidates = list(dict.fromkeys(candidates + [item["model"] for item in
+            cfg.get("worker_recommendations", []) if isinstance(item, dict)
+            and isinstance(item.get("model"), str)] + [model for model in (default_model, main_model) if model]))
+    worker_catalog = cfg.get("worker_catalog")
+    catalog = (worker_catalog if isinstance(worker_catalog, dict) else cached_codex_model_catalog()) if tool == "codex" else {}
     model_descriptions = {}
     allowed_settings = []
     allowed_models = []
     for candidate in candidates:
+        if isinstance(worker_catalog, dict) and catalog and model_key(candidate) not in catalog:
+            continue
         tier = model_tier(candidate, policy)
         if main_tier is None:
             if model_key(candidate) != model_key(main_model):
@@ -833,9 +1658,16 @@ def model_policy(cfg, tool, mode):
     # Recommendations are advisory, and only exact pairs within the same
     # allowed set may be offered. Unknown or over-ceiling entries are omitted.
     allowed_pairs = {(model_key(item["model"]), item["effort"]) for item in allowed_settings}
+    worker_items = cfg.get("worker_recommendations", [])
+    if tool == "codex" and isinstance(cfg.get("worker_benchmark"), dict):
+        if cfg.get("recommendation_method") == LEGACY_RECOMMENDATION_METHOD:
+            profiles = terminal_bench_module().rank(cfg["worker_benchmark"], catalog, allowed_pairs, role="worker")
+            worker_items = [{"id": p["scene"], "label": p["label"], **p["candidates"][0]} for p in profiles]
+        else:
+            worker_items = rank_codex_radar_tradeoffs(cfg["worker_benchmark"], catalog, allowed_pairs)
     recommendations = [
         {"scene": item.get("label", item["id"]), "model": item["model"], "effort": item["effort"]}
-        for item in cfg.get("worker_recommendations", [])
+        for item in worker_items
         if (model_key(item["model"]), item["effort"]) in allowed_pairs
     ] if tool == "codex" else []
     return {
@@ -927,6 +1759,10 @@ def codex_settings(recommendation_id=None, team=False, cache=None):
         # Keep the exact launch-time cache snapshot so task routing is coherent
         # with the recommendation chosen for the lead.
         value["worker_recommendations"] = codex_radar_items(cache)
+        if isinstance(cache, dict) and isinstance(cache.get("benchmark"), dict):
+            value["worker_benchmark"] = cache["benchmark"]
+        if isinstance(cache, dict) and isinstance(cache.get("model_catalog"), dict):
+            value["worker_catalog"] = cache["model_catalog"]
         override = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "agent-team/config.json"
         if override.exists():
             personal = read(override).get("codex", {}).get("team", {})
@@ -997,10 +1833,10 @@ def validate_scene_models(cfg, team=False, tool="codex"):
         return validate_catalog(cfg, team, catalog)
     if not has_tier_pair(cfg):
         return
-    path = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "models_cache.json"
-    if not path.exists():
-        fail("Codex model catalog is unavailable; cannot validate the selected CodexRadar recommendation")
-    catalog = {model["slug"]: model for model in read(path).get("models", [])}
+    current = cached_codex_model_catalog(refresh=True)
+    if not current:
+        fail("Codex model catalog is unavailable; cannot validate the selected recommendation")
+    catalog = {model.get("slug", key): model for key, model in current.items()}
     return validate_catalog(cfg, team, catalog)
 
 
@@ -1039,7 +1875,7 @@ def start_codex(argv, tool="codex"):
     if options.tmux and not options.team:
         fail("--tmux requires --team")
     if tool == "codex":
-        cfg = codex_settings(options.recommendation, options.team)
+        cfg = recommendation_settings(options.recommendation, options.team)
     else:
         cfg = scene_settings(options.scene, options.team, options.adjust, tool=tool)
     if options.fast is not None:
@@ -1048,7 +1884,7 @@ def start_codex(argv, tool="codex"):
     if options.yolo is not None:
         cfg["yolo"] = options.yolo
     if tool == "codex" and not has_tier_pair(cfg):
-        message = "CodexRadar recommendation unavailable;" if options.recommendation else "No CodexRadar recommendation selected;"
+        message = "Recommendation unavailable;" if options.recommendation else "No recommendation selected;"
         print("agent-team: " + message + " using Codex defaults", file=sys.stderr)
     if options.check:
         validate_scene_models(cfg, options.team, tool=tool)
@@ -1128,7 +1964,7 @@ def start_simple(argv, tool):
 def settings(tool, budget, expert=False):
     if tool == "codex":
         if budget or expert:
-            fail("Codex budget/expert presets were removed; select a CodexRadar recommendation with --recommendation ID")
+            fail("Codex budget/expert presets were removed; select a recommendation with --recommendation ID")
         return scene_settings(team=True)
     config = read(CONFIG / "teams.json")
     if expert and tool != "codex":
@@ -1259,6 +2095,12 @@ def instructions(mode, worker=False, cfg=None, budget=False, expert=False, tool=
         model_instruction = (
             "Use the configured worker model and reasoning effort when delegating. Do not "
             "substitute another model or switch presets.\n"
+        )
+    if cfg.get("recommendation_method") == RECOMMENDATION_METHOD:
+        model_instruction += (
+            "The background recommendation is for small, bounded tasks with an explicit "
+            "checkable result. Verify the output and escalate ambiguous or failed work to a "
+            "stronger allowed model or the lead; do not assume parallel delegation is faster.\n"
         )
     common = ("Resolved configuration for THIS invocation (authoritative; do not infer it "
               "from other profiles or repository examples):\n" + json.dumps(selected, ensure_ascii=False) + "\n"
@@ -2141,10 +2983,10 @@ def main():
     global CODEX_RADAR_MENU_CACHE, CODEX_RADAR_RUNTIME
     CODEX_RADAR_RUNTIME = True
     argv = sys.argv[1:]
-    if argv == ["__refresh-codex-radar"]:
-        return run_codex_radar_background_refresh()
     if argv and argv[0] == "recommendations":
-        return codex_radar_command(argv[1:])
+        return recommendation_command(argv[1:])
+    if argv and argv[0] == "benchmarks":
+        return coding_benchmark_command(argv[1:])
     if argv and argv[0] == "start":
         if len(argv) < 2 or argv[1] not in TOOLS:
             fail("Usage: agent-team start <codex|traex|claude|opencode> [--recommendation ID] [--scene SCENE] [--team] [--tmux]")
@@ -2168,34 +3010,43 @@ def main():
             fail("Invalid agent selection")
         tool = available[int(choice) - 1]
         if tool == "codex":
-            CODEX_RADAR_MENU_CACHE = prepare_codex_radar_for_menu()
+            CODEX_RADAR_MENU_CACHE = prepare_recommendations()
             no_fast = False
             while True:
-                recommendations = codex_radar_menu_items(CODEX_RADAR_MENU_CACHE)
+                recommendations = recommendation_items(CODEX_RADAR_MENU_CACHE)
                 for number, item in enumerate(recommendations, 1):
                     print(f"{number}. {item['label']}")
+                for item in CODEX_RADAR_MENU_CACHE.get("unavailable_scenes", []):
+                    if isinstance(item, dict) and isinstance(item.get("label"), str):
+                        print(item["label"] + " · 暂无推荐")
+                print("0. Codex defaults (choose model after launch)")
                 if not recommendations:
-                    print("Presets unavailable; using Codex defaults.")
-                choice = input("Preset [1] (r: refresh, f: toggle Fast off): ").strip() or "1"
+                    print("Presets unavailable; Codex defaults are available.")
+                default = "1" if recommendations else "0"
+                choice = input("Preset [" + default + "] (r: refresh, f: toggle Fast off): ").strip() or default
                 if choice.lower() == "f":
                     no_fast = not no_fast
                     print("Fast: " + ("off" if no_fast else "follow recommendation"))
                     continue
                 if choice.lower() == "r":
                     try:
-                        CODEX_RADAR_MENU_CACHE, _ = update_codex_radar_recommendations(force=True, strict=True)
-                        print("Presets refreshed.")
+                        result = sync_all_benchmarks(force=True)
+                        if result["status"] in ("failed", "busy"):
+                            fail("Benchmark refresh " + result["status"])
+                        CODEX_RADAR_MENU_CACHE = prepare_recommendations(fetch_if_missing=False)
+                        print("Some sources failed; retained cached data." if result["status"] == "partial"
+                              else "Presets refreshed.")
                     except (RuntimeError, OSError) as error:
                         print("Preset refresh failed: " + str(error), file=sys.stderr)
                     continue
-                if recommendations:
+                if choice == "0":
+                    flags = []
+                elif recommendations:
                     if not choice.isdigit() or not 1 <= int(choice) <= len(recommendations):
                         fail("Invalid recommendation selection")
                     flags = ["--recommendation", recommendations[int(choice) - 1]["id"]]
                 else:
-                    if choice != "1":
-                        fail("Invalid recommendation selection")
-                    flags = []
+                    fail("Invalid recommendation selection")
                 if no_fast:
                     flags.append("--no-fast")
                 break
@@ -2231,10 +3082,11 @@ def main():
         return launch(argv[0], argv[1:])
     if argv[0] in ("-h", "--help"):
         print("Usage: agent-team [--tmux]  # choose a coding agent interactively\n"
-              "       agent-team recommendations <status|refresh|prepare>\n"
+              "       agent-team recommendations <status|refresh|prepare|sync|schedule>\n"
+              "       agent-team benchmarks <status|refresh>\n"
               "       agent-team <traex|opencode|claude> [--team-budget] [--tmux] [CLI args]\n"
               "       agent-team start <codex|traex|claude|opencode> [--recommendation ID] [--scene SCENE] [--team] [--tmux] [--fast|--no-fast] [--yolo|--no-yolo] [CLI args]\n"
-              "Codex recommendations are loaded from CodexRadar; without a recommendation Codex uses its defaults. Trae scenes: daily|hard|batch.\n"
+              "Codex recommendations use ModelDial, Terminal-Bench and CUA-Speedrun; without a recommendation Codex uses its defaults. Trae scenes: daily|hard|batch.\n"
 
               "       agent-team solo traex budget [TraeX args]\n"
               "       agent-team run <traex|opencode|claude> [--budget] [--no-yolo] [CLI args]\n"
